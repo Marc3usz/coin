@@ -613,9 +613,8 @@ impl ChainCore {
             start_height = 1;
         }
         let start = self
-            .store
-            .get_block_by_height(start_height)?
-            .ok_or_else(|| anyhow::anyhow!("missing retarget block"))?;
+            .ancestor_at_height(parent, start_height)?
+            .ok_or_else(|| anyhow::anyhow!("missing retarget block ancestor"))?;
         let actual = parent
             .header
             .timestamp
@@ -632,6 +631,20 @@ impl ChainCore {
             actual,
             expected,
         )))
+    }
+
+    fn ancestor_at_height(&self, block: &Block, height: u64) -> anyhow::Result<Option<Block>> {
+        if height > block.header.height {
+            return Ok(None);
+        }
+        let mut cursor = block.clone();
+        while cursor.header.height > height {
+            cursor = self
+                .store
+                .get_block_by_hash(&cursor.header.prev_block_hash)?
+                .ok_or_else(|| anyhow::anyhow!("missing ancestor block"))?;
+        }
+        Ok(Some(cursor))
     }
 }
 

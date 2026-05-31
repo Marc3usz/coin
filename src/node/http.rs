@@ -74,6 +74,7 @@ impl MiningStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
+    pub node_id: String,
     pub chain_id: u64,
     pub height: u64,
     pub head: String,
@@ -85,6 +86,8 @@ pub struct HealthResponse {
 pub struct PeerAnnouncement {
     pub url: String,
     pub height: u64,
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -290,11 +293,12 @@ pub async fn run_peer_sync(node: SharedNode) {
 }
 
 async fn scan_lan_for_peers(node: &SharedNode, client: &reqwest::Client) {
-    let (chain_id, self_port, self_genesis, known) = {
+    let (chain_id, self_id, self_port, self_genesis, known) = {
         let node = node.lock().unwrap();
         let self_genesis = genesis_hash(&node).unwrap_or_default();
         (
             node.core.cfg.chain_id,
+            node.discovery_id.clone(),
             listen_port(&node.core.cfg.listen_addr).unwrap_or(12367),
             self_genesis,
             node.peers.clone(),
@@ -322,6 +326,7 @@ async fn scan_lan_for_peers(node: &SharedNode, client: &reqwest::Client) {
         let node = node.clone();
         let client = client.clone();
         let self_genesis = self_genesis.clone();
+        let self_id = self_id.clone();
         tokio::spawn(async move {
             let base = peer.trim_end_matches('/');
             let Ok(res) = client.get(format!("{base}/health")).send().await else {
@@ -330,7 +335,7 @@ async fn scan_lan_for_peers(node: &SharedNode, client: &reqwest::Client) {
             let Ok(health) = res.json::<HealthResponse>().await else {
                 return;
             };
-            if !health.ok || health.chain_id != chain_id {
+            if !health.ok || health.node_id == self_id || health.chain_id != chain_id {
                 return;
             }
             if health.genesis != self_genesis {
@@ -375,6 +380,14 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
             return;
         }
     };
+    if health.node_id == node.lock().unwrap().discovery_id {
+        let mut node = node.lock().unwrap();
+        node.peers.remove(&peer);
+        node.discovered_peers.remove(&peer);
+        node.peer_status.remove(&peer);
+        node.push_discovery_log(format!("ignored self peer {peer}"));
+        return;
+    }
     if health.chain_id != node.lock().unwrap().core.cfg.chain_id {
         mark_peer_error(node, &peer, format!("wrong chain id {}", health.chain_id));
         return;
@@ -400,44 +413,7 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
     }
     mark_peer_ok(node, &peer, &health);
 
-    let local_height = node.lock().unwrap().core.store.height().unwrap_or(0);
-    if health.height > local_height {
-        for height in (local_height + 1)..=health.height {
-            let Ok(res) = client
-                .get(format!("{base}/block/height/{height}"))
-                .send()
-                .await
-            else {
-                break;
-            };
-            if !res.status().is_success() {
-                break;
-            }
-            let Ok(block) = res.json::<Block>().await else {
-                break;
-            };
-            let hash = block.hash().ok().map(|h| hex_hash(&h)).unwrap_or_default();
-            let accepted = {
-                let mut node = node.lock().unwrap();
-                match node.core.accept_block(block) {
-                    Ok(()) => {
-                        node.seen_blocks.insert(hash.clone());
-                        node.push_discovery_log(format!("synced block {height} from {peer}"));
-                        true
-                    }
-                    Err(err) => {
-                        node.push_discovery_log(format!(
-                            "sync block {height} from {peer} failed: {err}"
-                        ));
-                        false
-                    }
-                }
-            };
-            if !accepted {
-                break;
-            }
-        }
-    }
+    sync_blocks(node, client, &peer, base, &health).await;
 
     sync_mempool(node, client, &peer, base).await;
 
@@ -453,15 +429,120 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
         }
     }
 
-    let height = node.lock().unwrap().core.store.height().unwrap_or(0);
+    let (height, node_id) = {
+        let node = node.lock().unwrap();
+        (
+            node.core.store.height().unwrap_or(0),
+            node.discovery_id.clone(),
+        )
+    };
     let _ = client
         .post(format!("{base}/peers"))
         .json(&PeerAnnouncement {
             url: self_url,
             height,
+            node_id: Some(node_id),
         })
         .send()
         .await;
+}
+
+async fn sync_blocks(
+    node: &SharedNode,
+    client: &reqwest::Client,
+    peer: &str,
+    base: &str,
+    health: &HealthResponse,
+) {
+    let (local_height, local_head) = {
+        let node = node.lock().unwrap();
+        (
+            node.core.store.height().unwrap_or(0),
+            node.core
+                .head()
+                .ok()
+                .and_then(|block| block.hash().ok())
+                .map(|hash| hex_hash(&hash))
+                .unwrap_or_default(),
+        )
+    };
+    if health.height < local_height || (health.height == local_height && health.head == local_head)
+    {
+        return;
+    }
+
+    let mut common_height = None;
+    let mut height = health.height.min(local_height);
+    loop {
+        let remote_hash = match fetch_block_by_height(client, base, height).await {
+            Some(block) => block.hash().ok().map(|hash| (hex_hash(&hash), block)),
+            None => None,
+        };
+        let Some((remote_hash, remote_block)) = remote_hash else {
+            break;
+        };
+        let local_matches = {
+            let node = node.lock().unwrap();
+            node.core
+                .store
+                .get_block_by_height(height)
+                .ok()
+                .flatten()
+                .and_then(|block| block.hash().ok())
+                .is_some_and(|hash| hex_hash(&hash) == remote_hash)
+        };
+        if local_matches {
+            common_height = Some(height);
+            break;
+        }
+        if height == health.height {
+            let _ = accept_synced_block(node, peer, height, remote_block);
+        }
+        if height == 0 {
+            break;
+        }
+        height -= 1;
+    }
+
+    let start = common_height.map(|h| h + 1).unwrap_or(local_height + 1);
+    for height in start..=health.height {
+        let Some(block) = fetch_block_by_height(client, base, height).await else {
+            break;
+        };
+        if !accept_synced_block(node, peer, height, block) {
+            break;
+        }
+    }
+}
+
+async fn fetch_block_by_height(client: &reqwest::Client, base: &str, height: u64) -> Option<Block> {
+    let res = client
+        .get(format!("{base}/block/height/{height}"))
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    res.json::<Block>().await.ok()
+}
+
+fn accept_synced_block(node: &SharedNode, peer: &str, height: u64, block: Block) -> bool {
+    let hash = block.hash().ok().map(|h| hex_hash(&h)).unwrap_or_default();
+    let mut node = node.lock().unwrap();
+    match node.core.accept_block(block) {
+        Ok(()) => {
+            node.seen_blocks.insert(hash.clone());
+            node.push_discovery_log(format!("synced block {height} {hash} from {peer}"));
+            true
+        }
+        Err(err) => {
+            node.push_discovery_log(format!(
+                "sync block {height} {hash} from {peer} failed: {err}"
+            ));
+            false
+        }
+    }
 }
 
 async fn sync_mempool(node: &SharedNode, client: &reqwest::Client, peer: &str, base: &str) {
@@ -610,6 +691,7 @@ async fn health(State(node): State<SharedNode>) -> Json<HealthResponse> {
     let genesis = genesis_hash(&node).unwrap_or_else(|_| "unknown".to_string());
     Json(HealthResponse {
         ok: true,
+        node_id: node.discovery_id.clone(),
         chain_id: node.core.cfg.chain_id,
         height: node.core.store.height().unwrap_or(0),
         head: hex_hash(&head),
@@ -630,7 +712,13 @@ async fn announce_peer(
     State(node): State<SharedNode>,
     Json(msg): Json<PeerAnnouncement>,
 ) -> Json<serde_json::Value> {
-    node.lock().unwrap().peers.insert(msg.url);
+    let mut node = node.lock().unwrap();
+    if msg.node_id.as_deref() != Some(node.discovery_id.as_str()) {
+        let peer = normalize_peer_url(&msg.url);
+        if peer != advertised_peer_url(&node.core.cfg.listen_addr) {
+            node.peers.insert(peer);
+        }
+    }
     Json(serde_json::json!({ "accepted": true }))
 }
 
@@ -796,6 +884,21 @@ async fn fetch_announced_block(node: SharedNode, from: String, hash: String) {
     let Ok(block) = res.json::<Block>().await else {
         return;
     };
+    let parent_hash = block.header.prev_block_hash;
+    let parent_known = {
+        let node = node.lock().unwrap();
+        block.header.height == 0
+            || node
+                .core
+                .store
+                .get_block_by_hash(&parent_hash)
+                .ok()
+                .flatten()
+                .is_some()
+    };
+    if !parent_known {
+        fetch_block_by_hash_once(&node, &client, base, parent_hash).await;
+    }
     let hash = block
         .hash()
         .ok()
@@ -823,6 +926,33 @@ async fn fetch_announced_block(node: SharedNode, from: String, hash: String) {
     };
     if let Some((peers, from)) = accepted {
         tokio::spawn(async move { gossip_block(peers, from, block_for_gossip).await });
+    }
+}
+
+async fn fetch_block_by_hash_once(
+    node: &SharedNode,
+    client: &reqwest::Client,
+    base: &str,
+    hash: [u8; 32],
+) {
+    let hash_hex = hex_hash(&hash);
+    let Ok(res) = client
+        .get(format!("{base}/block/hash/{hash_hex}"))
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !res.status().is_success() {
+        return;
+    }
+    let Ok(block) = res.json::<Block>().await else {
+        return;
+    };
+    let mut node = node.lock().unwrap();
+    if node.core.accept_block(block).is_ok() {
+        node.seen_blocks.insert(hash_hex.clone());
+        node.push_discovery_log(format!("fetched missing parent {hash_hex}"));
     }
 }
 
