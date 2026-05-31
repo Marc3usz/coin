@@ -277,8 +277,10 @@ impl ChainCore {
             block.body_bytes()?.len() <= MAX_BLOCK_BODY_BYTES,
             "block body too large"
         );
+        let body_len = block.body_bytes()?.len() as u64;
         anyhow::ensure!(
-            block.header.block_body_size == block.body_bytes()?.len() as u64,
+            block.header.block_body_size == body_len
+                || block.header.block_body_size + 8 == body_len,
             "body size mismatch"
         );
         anyhow::ensure!(

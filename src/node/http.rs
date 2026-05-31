@@ -22,6 +22,7 @@ pub struct NodeServer {
     pub peers: HashSet<String>,
     pub discovered_peers: HashSet<String>,
     pub peer_status: HashMap<String, PeerStatus>,
+    pub orphan_blocks: HashMap<String, Block>,
     pub discovery_logs: Vec<String>,
     pub seen_txs: HashSet<String>,
     pub seen_blocks: HashSet<String>,
@@ -109,6 +110,7 @@ impl NodeServer {
             peers,
             discovered_peers: HashSet::new(),
             peer_status: HashMap::new(),
+            orphan_blocks: HashMap::new(),
             discovery_logs: vec!["LAN discovery ready".to_string()],
             seen_txs: HashSet::new(),
             seen_blocks: HashSet::new(),
@@ -290,6 +292,7 @@ pub async fn run_peer_sync(node: SharedNode) {
         for peer in peers {
             sync_peer(&node, &client, peer, self_url.clone()).await;
         }
+        retry_orphans(&node);
     }
 }
 
@@ -553,6 +556,23 @@ async fn fetch_block_by_height(client: &reqwest::Client, base: &str, height: u64
 
 fn accept_synced_block(node: &SharedNode, peer: &str, height: u64, block: Block) -> bool {
     let hash = block.hash().ok().map(|h| hex_hash(&h)).unwrap_or_default();
+    let parent_known = {
+        let node = node.lock().unwrap();
+        block.header.height == 0
+            || node
+                .core
+                .store
+                .get_block_by_hash(&block.header.prev_block_hash)
+                .ok()
+                .flatten()
+                .is_some()
+    };
+    if !parent_known {
+        let mut node = node.lock().unwrap();
+        node.orphan_blocks.insert(hash.clone(), block);
+        node.push_discovery_log(format!("stored orphan block {height} {hash} from {peer}"));
+        return false;
+    }
     let mut node = node.lock().unwrap();
     match node.core.accept_block(block) {
         Ok(()) => {
@@ -565,6 +585,22 @@ fn accept_synced_block(node: &SharedNode, peer: &str, height: u64, block: Block)
                 "sync block {height} {hash} from {peer} failed: {err}"
             ));
             false
+        }
+    }
+}
+
+fn retry_orphans(node: &SharedNode) {
+    let pending = {
+        let node = node.lock().unwrap();
+        node.orphan_blocks.values().cloned().collect::<Vec<_>>()
+    };
+    for block in pending {
+        let hash = block.hash().ok().map(|h| hex_hash(&h)).unwrap_or_default();
+        let mut node = node.lock().unwrap();
+        if node.core.accept_block(block).is_ok() {
+            node.orphan_blocks.remove(&hash);
+            node.seen_blocks.insert(hash.clone());
+            node.push_discovery_log(format!("accepted orphan block {hash}"));
         }
     }
 }
