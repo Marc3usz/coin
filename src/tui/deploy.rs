@@ -1,5 +1,6 @@
 use crate::chain::contract_address;
 use crate::crypto::hex_hash;
+use crate::node::gossip_tx;
 use crate::tui::app::{push_log, App};
 use crate::types::Transaction;
 use crate::vm::decode_contract_blob;
@@ -178,9 +179,10 @@ fn submit_contract_deploy(app: &mut App) {
         &mut app.deploy_state.logs,
         format!("signed tx: {}", hex_hash(&tx_hash)),
     );
-    let peers_len = node.peers.len();
-    let result = node.core.submit_tx(tx, peers_len);
+    let peers = node.peers.iter().cloned().collect::<Vec<_>>();
+    let result = node.core.submit_tx(tx.clone(), peers.len());
     if result.accepted {
+        tokio::spawn(gossip_tx(peers, tx));
         let submitted_hash = result.tx_hash.unwrap_or(tx_hash);
         app.deploy_state.result_msg = format!(
             "deploy submitted: {}\nexpected contract address after mining: {}",

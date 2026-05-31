@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use coin::chain::ChainCore;
 use coin::config::NodeConfig;
 use coin::crypto::{decode_hash, hex_hash, Address};
-use coin::node::{gossip_block_header, normalize_peer_url, run_lan_discovery, serve, NodeServer};
+use coin::node::{
+    gossip_block_header, normalize_peer_url, run_lan_discovery, run_peer_sync, serve, NodeServer,
+};
 use coin::types::Transaction;
 use coin::wallet::{sign_tx, WalletFile};
 use std::path::PathBuf;
@@ -163,6 +165,11 @@ pub fn start_node_background(mut cfg: NodeConfig) -> anyhow::Result<Arc<Mutex<No
     let discovery_node = node.clone();
     tokio::spawn(async move {
         run_lan_discovery(discovery_node).await;
+    });
+
+    let sync_node = node.clone();
+    tokio::spawn(async move {
+        run_peer_sync(sync_node).await;
     });
 
     Ok(node)

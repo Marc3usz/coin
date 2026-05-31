@@ -1,4 +1,5 @@
 use crate::crypto::decode_hash;
+use crate::node::gossip_tx;
 use crate::tui::app::App;
 use crate::types::Transaction;
 use crate::wallet::{sign_tx, WalletFile};
@@ -132,9 +133,10 @@ fn submit_transfer(app: &mut App) {
         }
     };
 
-    let peers_len = node.peers.len();
-    let result = node.core.submit_tx(tx, peers_len);
+    let peers = node.peers.iter().cloned().collect::<Vec<_>>();
+    let result = node.core.submit_tx(tx.clone(), peers.len());
     if result.accepted {
+        tokio::spawn(gossip_tx(peers, tx));
         app.transfer_state.result_msg = format!(
             "Success! Tx Hash: {}",
             crate::crypto::hex_hash(&result.tx_hash.unwrap())

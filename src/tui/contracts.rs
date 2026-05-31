@@ -1,4 +1,5 @@
 use crate::crypto::{decode_hash, hex_hash};
+use crate::node::gossip_tx;
 use crate::tui::app::{push_log, App};
 use crate::types::Transaction;
 use crate::vm::{encode_contract_call, ContractCallKind, ContractCallPayload, Value};
@@ -225,9 +226,10 @@ fn submit_contract_call(app: &mut App) {
         &mut app.contracts_state.logs,
         format!("signed tx: {}", hex_hash(&tx_hash)),
     );
-    let peers_len = node.peers.len();
-    let result = node.core.submit_tx(tx, peers_len);
+    let peers = node.peers.iter().cloned().collect::<Vec<_>>();
+    let result = node.core.submit_tx(tx.clone(), peers.len());
     if result.accepted {
+        tokio::spawn(gossip_tx(peers, tx));
         let submitted_hash = result.tx_hash.unwrap_or(tx_hash);
         app.contracts_state.result_msg = format!("call submitted: {}", hex_hash(&submitted_hash));
         push_log(

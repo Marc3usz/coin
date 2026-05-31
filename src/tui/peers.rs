@@ -53,7 +53,8 @@ fn add_peer(app: &mut App) {
 
     match save_result {
         Ok(()) => {
-            app.peers_state.result_msg = format!("added peer {peer}");
+            app.peers_state.result_msg =
+                format!("added peer {peer}; sync loop will connect within a few seconds");
             app.peers_state.peer_input.reset();
             app.peers_state.focus = 1;
         }
@@ -74,7 +75,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    let (listen_addr, peers, discovered, logs) = {
+    let (listen_addr, peers, discovered, statuses, logs) = {
         let node = app.node.lock().unwrap();
         let mut peers = node.peers.iter().cloned().collect::<Vec<_>>();
         peers.sort();
@@ -84,6 +85,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             node.core.cfg.listen_addr.clone(),
             peers,
             discovered,
+            node.peer_status.clone(),
             node.discovery_logs.clone(),
         )
     };
@@ -99,7 +101,24 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             } else {
                 "manual"
             };
-            text.push_str(&format!("  {peer} [{tag}]\n"));
+            let status = statuses
+                .get(peer)
+                .map(|status| {
+                    if status.ok {
+                        format!(
+                            "online height={} seen={}s ago",
+                            status.height.unwrap_or(0),
+                            status.last_seen.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                        )
+                    } else {
+                        format!(
+                            "offline: {}",
+                            status.last_error.as_deref().unwrap_or("unknown error")
+                        )
+                    }
+                })
+                .unwrap_or_else(|| "pending connect".to_string());
+            text.push_str(&format!("  {peer} [{tag}] {status}\n"));
         }
     }
     text.push_str("\nDiscovery log:\n");

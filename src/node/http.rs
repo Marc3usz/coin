@@ -20,11 +20,20 @@ pub struct NodeServer {
     pub discovery_id: String,
     pub peers: HashSet<String>,
     pub discovered_peers: HashSet<String>,
+    pub peer_status: HashMap<String, PeerStatus>,
     pub discovery_logs: Vec<String>,
     pub seen_txs: HashSet<String>,
     pub seen_blocks: HashSet<String>,
     pub bad_peers: HashMap<String, Instant>,
     pub mining: MiningStatus,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerStatus {
+    pub ok: bool,
+    pub height: Option<u64>,
+    pub last_seen: Option<Instant>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,9 +68,10 @@ impl MiningStatus {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
+    pub chain_id: u64,
     pub height: u64,
     pub head: String,
     pub peers: usize,
@@ -90,6 +100,7 @@ impl NodeServer {
             discovery_id: new_discovery_id(),
             peers,
             discovered_peers: HashSet::new(),
+            peer_status: HashMap::new(),
             discovery_logs: vec!["LAN discovery ready".to_string()],
             seen_txs: HashSet::new(),
             seen_blocks: HashSet::new(),
@@ -212,11 +223,167 @@ fn listen_port(listen_addr: &str) -> Option<u16> {
 }
 
 pub fn normalize_peer_url(peer: &str) -> String {
-    if peer.starts_with("http://") || peer.starts_with("https://") {
+    let peer = if peer.starts_with("http://") || peer.starts_with("https://") {
         peer.trim_end_matches('/').to_string()
     } else {
         format!("http://{}", peer.trim_end_matches('/'))
+    };
+    let Some((scheme, rest)) = peer.split_once("://") else {
+        return peer;
+    };
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    if host_port
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+    {
+        peer
+    } else {
+        format!("{scheme}://{rest}:12367")
     }
+}
+
+pub async fn run_peer_sync(node: SharedNode) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            node.lock()
+                .unwrap()
+                .push_discovery_log(format!("peer sync disabled: {err}"));
+            return;
+        }
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(4));
+    loop {
+        tick.tick().await;
+        let (peers, self_url) = {
+            let node = node.lock().unwrap();
+            let self_url = format!(
+                "http://{}",
+                node.core.cfg.listen_addr.replace("0.0.0.0", "127.0.0.1")
+            );
+            (node.peers.iter().cloned().collect::<Vec<_>>(), self_url)
+        };
+        for peer in peers {
+            sync_peer(&node, &client, peer, self_url.clone()).await;
+        }
+    }
+}
+
+async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, self_url: String) {
+    let base = peer.trim_end_matches('/');
+    let health = match client.get(format!("{base}/health")).send().await {
+        Ok(res) => match res.json::<HealthResponse>().await {
+            Ok(health) if health.ok => health,
+            Ok(_) => {
+                mark_peer_error(node, &peer, "health check failed".to_string());
+                return;
+            }
+            Err(err) => {
+                mark_peer_error(node, &peer, format!("health decode failed: {err}"));
+                return;
+            }
+        },
+        Err(err) => {
+            mark_peer_error(node, &peer, format!("connect failed: {err}"));
+            return;
+        }
+    };
+    if health.chain_id != node.lock().unwrap().core.cfg.chain_id {
+        mark_peer_error(node, &peer, format!("wrong chain id {}", health.chain_id));
+        return;
+    }
+    mark_peer_ok(node, &peer, health.height);
+
+    let local_height = node.lock().unwrap().core.store.height().unwrap_or(0);
+    if health.height > local_height {
+        for height in (local_height + 1)..=health.height {
+            let Ok(res) = client
+                .get(format!("{base}/block/height/{height}"))
+                .send()
+                .await
+            else {
+                break;
+            };
+            if !res.status().is_success() {
+                break;
+            }
+            let Ok(block) = res.json::<Block>().await else {
+                break;
+            };
+            let hash = block.hash().ok().map(|h| hex_hash(&h)).unwrap_or_default();
+            let accepted = {
+                let mut node = node.lock().unwrap();
+                match node.core.accept_block(block) {
+                    Ok(()) => {
+                        node.seen_blocks.insert(hash.clone());
+                        node.push_discovery_log(format!("synced block {height} from {peer}"));
+                        true
+                    }
+                    Err(err) => {
+                        node.push_discovery_log(format!(
+                            "sync block {height} from {peer} failed: {err}"
+                        ));
+                        false
+                    }
+                }
+            };
+            if !accepted {
+                break;
+            }
+        }
+    }
+
+    if let Ok(res) = client.get(format!("{base}/peers")).send().await {
+        if let Ok(remote_peers) = res.json::<Vec<String>>().await {
+            let mut node = node.lock().unwrap();
+            for remote_peer in remote_peers {
+                let remote_peer = normalize_peer_url(&remote_peer);
+                if remote_peer != self_url {
+                    node.peers.insert(remote_peer);
+                }
+            }
+        }
+    }
+
+    let height = node.lock().unwrap().core.store.height().unwrap_or(0);
+    let _ = client
+        .post(format!("{base}/peers"))
+        .json(&PeerAnnouncement {
+            url: self_url,
+            height,
+        })
+        .send()
+        .await;
+}
+
+fn mark_peer_ok(node: &SharedNode, peer: &str, height: u64) {
+    let mut node = node.lock().unwrap();
+    node.peer_status.insert(
+        peer.to_string(),
+        PeerStatus {
+            ok: true,
+            height: Some(height),
+            last_seen: Some(Instant::now()),
+            last_error: None,
+        },
+    );
+}
+
+fn mark_peer_error(node: &SharedNode, peer: &str, err: String) {
+    let mut node = node.lock().unwrap();
+    node.peer_status.insert(
+        peer.to_string(),
+        PeerStatus {
+            ok: false,
+            height: None,
+            last_seen: None,
+            last_error: Some(err.clone()),
+        },
+    );
+    node.push_discovery_log(format!("peer {peer}: {err}"));
 }
 
 pub async fn serve(node: SharedNode) -> anyhow::Result<()> {
@@ -250,6 +417,7 @@ async fn health(State(node): State<SharedNode>) -> Json<HealthResponse> {
     let head = node.core.head().and_then(|b| b.hash()).unwrap_or([0; 32]);
     Json(HealthResponse {
         ok: true,
+        chain_id: node.core.cfg.chain_id,
         height: node.core.store.height().unwrap_or(0),
         head: hex_hash(&head),
         peers: node.peers.len(),
@@ -276,9 +444,31 @@ async fn submit_tx_json(
     State(node): State<SharedNode>,
     Json(tx): Json<Transaction>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut node = node.lock().unwrap();
-    let peers = node.peers.len();
-    let result = node.core.submit_tx(tx, peers);
+    let (result, peers, tx_for_gossip) = {
+        let mut node = node.lock().unwrap();
+        let tx_hash = tx.hash().ok().map(|hash| hex_hash(&hash));
+        if tx_hash
+            .as_ref()
+            .is_some_and(|hash| node.seen_txs.contains(hash))
+        {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "accepted": true, "warning": "already seen" })),
+            );
+        }
+        let peers = node.peers.iter().cloned().collect::<Vec<_>>();
+        let result = node.core.submit_tx(tx.clone(), peers.len());
+        if result.accepted {
+            if let Some(hash) = tx_hash {
+                node.seen_txs.insert(hash);
+            }
+        }
+        let tx_for_gossip = result.accepted.then_some(tx);
+        (result, peers, tx_for_gossip)
+    };
+    if let Some(tx) = tx_for_gossip {
+        tokio::spawn(gossip_tx(peers, tx));
+    }
     (
         if result.accepted {
             StatusCode::OK
@@ -306,21 +496,36 @@ async fn submit_block_json(
     State(node): State<SharedNode>,
     Json(block): Json<Block>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut node = node.lock().unwrap();
     let hash = block.hash().unwrap_or([0; 32]);
-    match node.core.accept_block(block) {
-        Ok(()) => {
-            node.seen_blocks.insert(hex_hash(&hash));
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "accepted": true, "hash": hex_hash(&hash) })),
-            )
+    let block_for_gossip = block.clone();
+    let accepted = {
+        let mut node = node.lock().unwrap();
+        match node.core.accept_block(block) {
+            Ok(()) => {
+                node.seen_blocks.insert(hex_hash(&hash));
+                Some((
+                    node.peers.iter().cloned().collect::<Vec<_>>(),
+                    format!(
+                        "http://{}",
+                        node.core.cfg.listen_addr.replace("0.0.0.0", "127.0.0.1")
+                    ),
+                ))
+            }
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "accepted": false, "error": err.to_string() })),
+                )
+            }
         }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "accepted": false, "error": err.to_string() })),
-        ),
+    };
+    if let Some((peers, from)) = accepted {
+        tokio::spawn(async move { gossip_block_header(peers, from, &block_for_gossip).await });
     }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "accepted": true, "hash": hex_hash(&hash) })),
+    )
 }
 
 async fn submit_block_bin(

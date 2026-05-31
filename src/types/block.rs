@@ -78,7 +78,7 @@ pub fn receipt_root(receipts: &[Receipt]) -> anyhow::Result<Hash> {
     Ok(merkle_root(hashes))
 }
 
-pub fn genesis_header(chain_id: u64, miner_address: Address) -> BlockHeader {
+pub fn genesis_header(chain_id: u64, _miner_address: Address) -> BlockHeader {
     BlockHeader {
         magic: MAGIC,
         protocol_version: PROTOCOL_VERSION,
@@ -93,7 +93,7 @@ pub fn genesis_header(chain_id: u64, miner_address: Address) -> BlockHeader {
         block_gas_limit: 30_000_000,
         gas_price: GENESIS_GAS_PRICE,
         gas_used: 0,
-        miner_address,
+        miner_address: [0; 32],
         tx_root: merkle_root(vec![]),
         receipt_root: merkle_root(vec![]),
     }
