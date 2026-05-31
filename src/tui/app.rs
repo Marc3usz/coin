@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Tabs},
     Terminal,
 };
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::{io, time::Duration};
 use tui_input::Input;
@@ -27,11 +28,12 @@ pub enum Tab {
     Deploy,
     AddressBook,
     AbiWizard,
+    Peers,
     Search,
 }
 
 impl Tab {
-    const ALL: [Tab; 8] = [
+    const ALL: [Tab; 9] = [
         Tab::Dashboard,
         Tab::Wallet,
         Tab::Transfer,
@@ -39,6 +41,7 @@ impl Tab {
         Tab::Deploy,
         Tab::AddressBook,
         Tab::AbiWizard,
+        Tab::Peers,
         Tab::Search,
     ];
 
@@ -51,7 +54,8 @@ impl Tab {
             Tab::Deploy => "5. Deploy",
             Tab::AddressBook => "6. Address Book",
             Tab::AbiWizard => "7. ABI Wizard",
-            Tab::Search => "8. Search",
+            Tab::Peers => "8. Peers",
+            Tab::Search => "9. Search",
         }
     }
 }
@@ -126,7 +130,7 @@ impl Default for TransferState {
             to_input: Input::default(),
             amount_input: Input::default(),
             fee_input: Input::default().with_value("1".to_string()),
-            focus: 0,
+            focus: 3,
             result_msg: String::new(),
         }
     }
@@ -138,6 +142,10 @@ pub struct ContractsState {
     pub args_input: Input,
     pub value_input: Input,
     pub fee_input: Input,
+    pub arg_inputs: Vec<Input>,
+    pub arg_labels: Vec<String>,
+    pub arg_types: Vec<String>,
+    pub abi_signature: Option<String>,
     pub focus: usize,
     pub result_msg: String,
     pub logs: Vec<String>,
@@ -161,7 +169,11 @@ impl Default for ContractsState {
             args_input: Input::default(),
             value_input: Input::default().with_value("0".to_string()),
             fee_input: Input::default().with_value("1".to_string()),
-            focus: 0,
+            arg_inputs: Vec::new(),
+            arg_labels: Vec::new(),
+            arg_types: Vec::new(),
+            abi_signature: None,
+            focus: 5,
             result_msg: String::new(),
             logs: vec!["contract wizard ready".to_string()],
         }
@@ -175,7 +187,7 @@ impl Default for DeployState {
             deploy_gas_input: Input::default().with_value("10000000".to_string()),
             value_input: Input::default().with_value("0".to_string()),
             fee_input: Input::default().with_value("1".to_string()),
-            focus: 0,
+            focus: 4,
             result_msg: String::new(),
             logs: vec!["deploy wizard ready".to_string()],
         }
@@ -207,6 +219,7 @@ pub struct AbiWizardState {
     pub method_id_input: Input,
     pub name_input: Input,
     pub args_input: Input,
+    pub params_input: Input,
     pub rets_input: Input,
     pub focus: usize,
     pub result_msg: String,
@@ -219,9 +232,26 @@ impl Default for AbiWizardState {
             method_id_input: Input::default(),
             name_input: Input::default(),
             args_input: Input::default().with_value("0".to_string()),
+            params_input: Input::default(),
             rets_input: Input::default().with_value("0".to_string()),
-            focus: 0,
+            focus: 6,
             result_msg: String::new(),
+        }
+    }
+}
+
+pub struct PeersState {
+    pub peer_input: Input,
+    pub focus: usize,
+    pub result_msg: String,
+}
+
+impl Default for PeersState {
+    fn default() -> Self {
+        Self {
+            peer_input: Input::default(),
+            focus: 1,
+            result_msg: "LAN discovery runs in the background. Add a URL or host:port.".to_string(),
         }
     }
 }
@@ -262,6 +292,7 @@ pub fn push_log(logs: &mut Vec<String>, msg: impl Into<String>) {
 
 pub struct App {
     pub node: Arc<Mutex<NodeServer>>,
+    pub config_path: PathBuf,
     pub address_book: AddressBook,
     pub active_tab: Tab,
     pub running: bool,
@@ -271,18 +302,23 @@ pub struct App {
     pub deploy_state: DeployState,
     pub address_book_state: AddressBookState,
     pub abi_wizard_state: AbiWizardState,
+    pub peers_state: PeersState,
     pub search_state: SearchState,
 }
 
 impl App {
-    pub fn new(node: Arc<Mutex<NodeServer>>) -> Result<Self> {
-        let ab_path = {
+    pub fn new(node: Arc<Mutex<NodeServer>>, config_path: Option<PathBuf>) -> Result<Self> {
+        let (ab_path, config_path) = {
             let n = node.lock().unwrap();
-            n.core.cfg.config_dir.join("address_book.toml")
+            (
+                n.core.cfg.config_dir.join("address_book.toml"),
+                config_path.unwrap_or_else(|| n.core.cfg.config_dir.join("config.toml")),
+            )
         };
         let address_book = AddressBook::load(&ab_path).unwrap_or_default();
         Ok(Self {
             node,
+            config_path,
             address_book,
             active_tab: Tab::Dashboard,
             running: true,
@@ -292,6 +328,7 @@ impl App {
             deploy_state: DeployState::default(),
             address_book_state: AddressBookState::default(),
             abi_wizard_state: AbiWizardState::default(),
+            peers_state: PeersState::default(),
             search_state: SearchState::default(),
         })
     }
@@ -332,6 +369,9 @@ impl App {
                                 self.active_tab = Tab::AbiWizard
                             }
                             KeyCode::Char('8') if !self.text_input_focused() => {
+                                self.active_tab = Tab::Peers
+                            }
+                            KeyCode::Char('9') if !self.text_input_focused() => {
                                 self.active_tab = Tab::Search
                             }
                             KeyCode::Esc => {
@@ -351,6 +391,7 @@ impl App {
                                     crate::tui::address_book::handle_event(self, key)
                                 }
                                 Tab::AbiWizard => crate::tui::abi_wizard::handle_event(self, key),
+                                Tab::Peers => crate::tui::peers::handle_event(self, key),
                                 Tab::Search => crate::tui::search::handle_event(self, key),
                             },
                         }
@@ -394,6 +435,7 @@ impl App {
             Tab::Deploy => crate::tui::deploy::draw(self, f, chunks[1]),
             Tab::AddressBook => crate::tui::address_book::draw(self, f, chunks[1]),
             Tab::AbiWizard => crate::tui::abi_wizard::draw(self, f, chunks[1]),
+            Tab::Peers => crate::tui::peers::draw(self, f, chunks[1]),
             Tab::Search => crate::tui::search::draw(self, f, chunks[1]),
         }
     }
@@ -403,10 +445,14 @@ impl App {
             Tab::Dashboard => false,
             Tab::Wallet => self.wallet_state.prompt == WalletPrompt::ConfirmOverwrite,
             Tab::Transfer => self.transfer_state.focus < 3,
-            Tab::Contracts => self.contracts_state.focus < 5,
+            Tab::Contracts => {
+                let arg_count = self.contracts_state.arg_inputs.len().max(1);
+                self.contracts_state.focus != arg_count + 4
+            }
             Tab::Deploy => self.deploy_state.focus < 4,
             Tab::AddressBook => self.address_book_state.editing,
-            Tab::AbiWizard => self.abi_wizard_state.focus < 5,
+            Tab::AbiWizard => self.abi_wizard_state.focus < 6,
+            Tab::Peers => self.peers_state.focus == 0,
             Tab::Search => true,
         }
     }

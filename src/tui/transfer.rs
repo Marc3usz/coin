@@ -141,7 +141,7 @@ fn submit_transfer(app: &mut App) {
         );
         app.transfer_state.to_input.reset();
         app.transfer_state.amount_input.reset();
-        app.transfer_state.focus = 0;
+        app.transfer_state.focus = 3;
     } else {
         app.transfer_state.result_msg = format!(
             "Failed: {}",
@@ -190,7 +190,15 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     };
     let amount_widget = Paragraph::new(app.transfer_state.amount_input.value())
         .block(Block::default().borders(Borders::ALL).title(" Amount "))
-        .style(amount_style);
+        .style(field_style(
+            amount_style,
+            app.transfer_state
+                .amount_input
+                .value()
+                .trim()
+                .parse::<u128>()
+                .is_ok(),
+        ));
     f.render_widget(amount_widget, chunks[1]);
 
     // Fee
@@ -205,7 +213,15 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                 .borders(Borders::ALL)
                 .title(" Mining Tip (Fee) "),
         )
-        .style(fee_style);
+        .style(field_style(
+            fee_style,
+            app.transfer_state
+                .fee_input
+                .value()
+                .trim()
+                .parse::<u128>()
+                .is_ok(),
+        ));
     f.render_widget(fee_widget, chunks[2]);
 
     // Submit Button
@@ -227,4 +243,12 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(" Result "))
         .style(Style::default().fg(Color::Green));
     f.render_widget(res_widget, chunks[4]);
+}
+
+fn field_style(style: Style, valid: bool) -> Style {
+    if valid {
+        style
+    } else {
+        style.fg(Color::Red)
+    }
 }

@@ -1,4 +1,4 @@
-use crate::tui::address_book::AbiEntry;
+use crate::tui::address_book::{AbiEntry, AbiParam};
 use crate::tui::app::App;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -12,14 +12,14 @@ use tui_input::backend::crossterm::EventHandler;
 pub fn handle_event(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Down | KeyCode::Tab => {
-            app.abi_wizard_state.focus = (app.abi_wizard_state.focus + 1) % 6
+            app.abi_wizard_state.focus = (app.abi_wizard_state.focus + 1) % 7
         }
-        KeyCode::Up => app.abi_wizard_state.focus = (app.abi_wizard_state.focus + 5) % 6,
+        KeyCode::Up => app.abi_wizard_state.focus = (app.abi_wizard_state.focus + 6) % 7,
         KeyCode::Enter => {
-            if app.abi_wizard_state.focus == 5 {
+            if app.abi_wizard_state.focus == 6 {
                 save_abi(app);
             } else {
-                app.abi_wizard_state.focus = (app.abi_wizard_state.focus + 1) % 6;
+                app.abi_wizard_state.focus = (app.abi_wizard_state.focus + 1) % 7;
             }
         }
         _ => match app.abi_wizard_state.focus {
@@ -27,7 +27,8 @@ pub fn handle_event(app: &mut App, key: KeyEvent) {
             1 => input(&mut app.abi_wizard_state.method_id_input, key),
             2 => input(&mut app.abi_wizard_state.name_input, key),
             3 => input(&mut app.abi_wizard_state.args_input, key),
-            4 => input(&mut app.abi_wizard_state.rets_input, key),
+            4 => input(&mut app.abi_wizard_state.params_input, key),
+            5 => input(&mut app.abi_wizard_state.rets_input, key),
             _ => {}
         },
     }
@@ -75,6 +76,13 @@ fn save_abi(app: &mut App) {
             return;
         }
     };
+    let params = match parse_params(app.abi_wizard_state.params_input.value(), args) {
+        Ok(params) => params,
+        Err(err) => {
+            app.abi_wizard_state.result_msg = err;
+            return;
+        }
+    };
 
     let Some(entry) = app.address_book.entries.get_mut(&entry_name) else {
         app.abi_wizard_state.result_msg =
@@ -87,6 +95,7 @@ fn save_abi(app: &mut App) {
             name: name.clone(),
             args,
             rets,
+            params,
         },
     );
     let path = app
@@ -103,16 +112,54 @@ fn save_abi(app: &mut App) {
                 format!("saved ABI {method_id}: {name} on {entry_name}");
             app.abi_wizard_state.method_id_input.reset();
             app.abi_wizard_state.name_input.reset();
-            app.abi_wizard_state.focus = 1;
+            app.abi_wizard_state.params_input.reset();
+            app.abi_wizard_state.focus = 6;
         }
         Err(err) => app.abi_wizard_state.result_msg = format!("save failed: {err}"),
     }
+}
+
+fn parse_params(text: &str, args: u8) -> Result<Vec<AbiParam>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok((0..args)
+            .map(|idx| AbiParam {
+                name: format!("arg{}", idx + 1),
+                ty: "u64".to_string(),
+            })
+            .collect());
+    }
+
+    let mut params = Vec::new();
+    for raw in text.split(',') {
+        let raw = raw.trim();
+        let Some((name, ty)) = raw.split_once(':') else {
+            return Err("params must look like amount:u64,to:address".to_string());
+        };
+        let name = name.trim();
+        let ty = ty.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err("parameter names cannot be empty".to_string());
+        }
+        if !matches!(ty.as_str(), "u64" | "u256" | "address" | "string") {
+            return Err(format!("unsupported parameter type: {ty}"));
+        }
+        params.push(AbiParam {
+            name: name.to_string(),
+            ty,
+        });
+    }
+    if params.len() != args as usize {
+        return Err(format!("expected {args} params, got {}", params.len()));
+    }
+    Ok(params)
 }
 
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -166,12 +213,19 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     render_input(
         f,
         chunks[4],
-        " Return Count ",
-        app.abi_wizard_state.rets_input.value(),
+        " Params name:type,... ",
+        app.abi_wizard_state.params_input.value(),
         style(4),
     );
+    render_input(
+        f,
+        chunks[5],
+        " Return Count ",
+        app.abi_wizard_state.rets_input.value(),
+        style(5),
+    );
 
-    let btn_style = if app.abi_wizard_state.focus == 5 {
+    let btn_style = if app.abi_wizard_state.focus == 6 {
         Style::default()
             .bg(Color::Green)
             .fg(Color::Black)
@@ -183,10 +237,10 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Paragraph::new(" [ SAVE ABI MAPPING ] ")
             .block(Block::default().borders(Borders::ALL))
             .style(btn_style),
-        chunks[5],
+        chunks[6],
     );
 
-    let mut help = String::from("ABI mappings let Contract Calls use method names instead of raw IDs.\nAdd the contract address in tab 6 first, then save mappings here.\n\n");
+    let mut help = String::from("ABI mappings let Contract Calls use method names instead of raw IDs.\nParams are optional but enable individual typed call fields, e.g. to:address,amount:u64.\nAdd the contract address in tab 6 first, then save mappings here.\n\n");
     if !app.address_book.entries.is_empty() {
         help.push_str("Known entries: ");
         let mut names = app.address_book.entries.keys().cloned().collect::<Vec<_>>();
@@ -199,7 +253,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Paragraph::new(help)
             .block(Block::default().borders(Borders::ALL).title(" ABI Wizard "))
             .style(Style::default().fg(Color::Cyan)),
-        chunks[6],
+        chunks[7],
     );
 }
 

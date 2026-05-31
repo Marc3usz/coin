@@ -8,6 +8,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
@@ -17,6 +18,8 @@ pub type SharedNode = Arc<Mutex<NodeServer>>;
 pub struct NodeServer {
     pub core: ChainCore,
     pub peers: HashSet<String>,
+    pub discovered_peers: HashSet<String>,
+    pub discovery_logs: Vec<String>,
     pub seen_txs: HashSet<String>,
     pub seen_blocks: HashSet<String>,
     pub bad_peers: HashMap<String, Instant>,
@@ -84,6 +87,8 @@ impl NodeServer {
         Self {
             core,
             peers,
+            discovered_peers: HashSet::new(),
+            discovery_logs: vec!["LAN discovery ready".to_string()],
             seen_txs: HashSet::new(),
             seen_blocks: HashSet::new(),
             bad_peers: HashMap::new(),
@@ -99,6 +104,109 @@ impl NodeServer {
     pub fn punish_peer(&mut self, peer: String) {
         self.bad_peers
             .insert(peer, Instant::now() + Duration::from_secs(3600));
+    }
+
+    pub fn push_discovery_log(&mut self, msg: impl Into<String>) {
+        self.discovery_logs.push(msg.into());
+        if self.discovery_logs.len() > 12 {
+            self.discovery_logs.remove(0);
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LanAnnouncement {
+    magic: String,
+    chain_id: u64,
+    port: u16,
+    height: u64,
+}
+
+const LAN_DISCOVERY_PORT: u16 = 12368;
+const LAN_DISCOVERY_MAGIC: &str = "COINLAN1";
+
+pub async fn run_lan_discovery(node: SharedNode) {
+    let bind_addr = format!("0.0.0.0:{LAN_DISCOVERY_PORT}");
+    let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            node.lock()
+                .unwrap()
+                .push_discovery_log(format!("LAN discovery disabled: {err}"));
+            return;
+        }
+    };
+    if let Err(err) = socket.set_broadcast(true) {
+        node.lock()
+            .unwrap()
+            .push_discovery_log(format!("LAN broadcast disabled: {err}"));
+    }
+
+    let mut buf = [0u8; 512];
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => announce_lan(&socket, &node).await,
+            received = socket.recv_from(&mut buf) => {
+                if let Ok((len, from)) = received {
+                    handle_lan_packet(&node, &buf[..len], from);
+                }
+            }
+        }
+    }
+}
+
+async fn announce_lan(socket: &tokio::net::UdpSocket, node: &SharedNode) {
+    let msg = {
+        let node = node.lock().unwrap();
+        let Some(port) = listen_port(&node.core.cfg.listen_addr) else {
+            return;
+        };
+        LanAnnouncement {
+            magic: LAN_DISCOVERY_MAGIC.to_string(),
+            chain_id: node.core.cfg.chain_id,
+            port,
+            height: node.core.store.height().unwrap_or(0),
+        }
+    };
+    let Ok(bytes) = serde_json::to_vec(&msg) else {
+        return;
+    };
+    let target = format!("255.255.255.255:{LAN_DISCOVERY_PORT}");
+    let _ = socket.send_to(&bytes, target).await;
+}
+
+fn handle_lan_packet(node: &SharedNode, bytes: &[u8], from: SocketAddr) {
+    let Ok(msg) = serde_json::from_slice::<LanAnnouncement>(bytes) else {
+        return;
+    };
+    if msg.magic != LAN_DISCOVERY_MAGIC || from.ip().is_loopback() {
+        return;
+    }
+    let peer = normalize_peer_url(&format!("{}:{}", from.ip(), msg.port));
+    let mut node = node.lock().unwrap();
+    if msg.chain_id != node.core.cfg.chain_id {
+        return;
+    }
+    if listen_port(&node.core.cfg.listen_addr) == Some(msg.port) {
+        return;
+    }
+    let is_new = node.peers.insert(peer.clone());
+    node.discovered_peers.insert(peer.clone());
+    if is_new {
+        node.push_discovery_log(format!("discovered {peer} at height {}", msg.height));
+    }
+}
+
+fn listen_port(listen_addr: &str) -> Option<u16> {
+    listen_addr.rsplit_once(':')?.1.parse::<u16>().ok()
+}
+
+pub fn normalize_peer_url(peer: &str) -> String {
+    if peer.starts_with("http://") || peer.starts_with("https://") {
+        peer.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", peer.trim_end_matches('/'))
     }
 }
 

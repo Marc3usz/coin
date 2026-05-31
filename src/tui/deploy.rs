@@ -196,7 +196,7 @@ fn submit_contract_deploy(app: &mut App) {
             "waiting for miner to include tx in a block",
         );
         app.deploy_state.deploy_path_input.reset();
-        app.deploy_state.focus = 0;
+        app.deploy_state.focus = 4;
     } else {
         let error = result.error.unwrap_or_else(|| "unknown error".to_string());
         app.deploy_state.result_msg = format!("failed: {}", error);
@@ -279,21 +279,35 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         chunks[1],
         " Initial Coins to Send ",
         app.deploy_state.value_input.value(),
-        style(1),
+        field_style(
+            style(1),
+            parse_u128(app.deploy_state.value_input.value().trim(), "value").is_ok(),
+        ),
     );
     render_input(
         f,
         chunks[2],
         " Gas Limit ",
         app.deploy_state.deploy_gas_input.value(),
-        style(2),
+        field_style(
+            style(2),
+            app.deploy_state
+                .deploy_gas_input
+                .value()
+                .trim()
+                .parse::<u64>()
+                .is_ok_and(|v| v > 0),
+        ),
     );
     render_input(
         f,
         chunks[3],
         " Mining Tip ",
         app.deploy_state.fee_input.value(),
-        style(3),
+        field_style(
+            style(3),
+            parse_u128(app.deploy_state.fee_input.value().trim(), "fee").is_ok(),
+        ),
     );
     let btn_style = if app.deploy_state.focus == 4 {
         Style::default()
@@ -325,6 +339,14 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             .style(Style::default().fg(Color::Cyan)),
         chunks[6],
     );
+}
+
+fn field_style(style: Style, valid: bool) -> Style {
+    if valid {
+        style
+    } else {
+        style.fg(Color::Red)
+    }
 }
 
 fn render_input(f: &mut Frame, area: Rect, title: &str, value: &str, style: Style) {

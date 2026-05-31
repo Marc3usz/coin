@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use coin::chain::ChainCore;
 use coin::config::NodeConfig;
 use coin::crypto::{decode_hash, hex_hash, Address};
-use coin::node::{gossip_block_header, serve, NodeServer};
+use coin::node::{gossip_block_header, normalize_peer_url, run_lan_discovery, serve, NodeServer};
 use coin::types::Transaction;
 use coin::wallet::{sign_tx, WalletFile};
 use std::path::PathBuf;
@@ -160,6 +160,11 @@ pub fn start_node_background(mut cfg: NodeConfig) -> anyhow::Result<Arc<Mutex<No
         }
     });
 
+    let discovery_node = node.clone();
+    tokio::spawn(async move {
+        run_lan_discovery(discovery_node).await;
+    });
+
     Ok(node)
 }
 
@@ -213,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
             let cfg = NodeConfig {
                 chain_id,
                 listen_addr: listen,
-                peers: peer.into_iter().map(normalize_peer).collect(),
+                peers: peer.into_iter().map(|p| normalize_peer_url(&p)).collect(),
                 mine: !no_mine,
                 reject_zero_tip: false,
                 block_gas_limit: default.block_gas_limit,
@@ -247,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", toml::to_string_pretty(&cfg)?);
                 }
                 ConfigCommands::AddPeer { peer } => {
-                    let peer = normalize_peer(peer);
+                    let peer = normalize_peer_url(&peer);
                     if !cfg.peers.contains(&peer) {
                         cfg.peers.push(peer.clone());
                     }
@@ -255,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("added peer: {peer}");
                 }
                 ConfigCommands::RemovePeer { peer } => {
-                    let peer = normalize_peer(peer);
+                    let peer = normalize_peer_url(&peer);
                     cfg.peers.retain(|p| p != &peer);
                     cfg.save(&path)?;
                     println!("removed peer: {peer}");
@@ -350,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Tui => {
             let node = start_node_background(cfg)?;
-            let mut app = coin::tui::App::new(node)?;
+            let mut app = coin::tui::App::new(node, config_path)?;
             app.run()?;
         }
     }
@@ -359,12 +364,4 @@ async fn main() -> anyhow::Result<()> {
 
 fn parse_optional_address(value: Option<String>) -> anyhow::Result<Option<Address>> {
     value.map(|v| decode_hash(&v)).transpose()
-}
-
-fn normalize_peer(peer: String) -> String {
-    if peer.starts_with("http://") || peer.starts_with("https://") {
-        peer.trim_end_matches('/').to_string()
-    } else {
-        format!("http://{}", peer.trim_end_matches('/'))
-    }
 }

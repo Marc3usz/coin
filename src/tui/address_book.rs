@@ -42,6 +42,14 @@ pub struct AbiEntry {
     pub name: String,
     pub args: u8,
     pub rets: u8,
+    #[serde(default)]
+    pub params: Vec<AbiParam>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AbiParam {
+    pub name: String,
+    pub ty: String,
 }
 
 impl AddressBook {
@@ -236,9 +244,15 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             if let Some(entry) = app.address_book.entries.get(name) {
                 text.push_str(&format!("{marker} {name}\n  {}\n", entry.address));
                 for (id, abi) in &entry.abis {
+                    let params = abi
+                        .params
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, p.ty))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     text.push_str(&format!(
-                        "    ABI {id}: {} args={} rets={}\n",
-                        abi.name, abi.args, abi.rets
+                        "    ABI {id}: {}({}) args={} rets={}\n",
+                        abi.name, params, abi.args, abi.rets
                     ));
                 }
             }

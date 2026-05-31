@@ -4,6 +4,7 @@ use crate::types::Transaction;
 use crate::vm::{encode_contract_call, ContractCallKind, ContractCallPayload, Value};
 use crate::wallet::{sign_tx, WalletFile};
 use crossterm::event::{KeyCode, KeyEvent};
+use ethnum::U256;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -13,24 +14,22 @@ use ratatui::{
 use tui_input::backend::crossterm::EventHandler;
 
 pub fn handle_event(app: &mut App, key: KeyEvent) {
+    refresh_abi_fields(app);
+    let total = contract_field_count(app);
+    let submit = total - 1;
     match key.code {
-        KeyCode::Down => app.contracts_state.focus = (app.contracts_state.focus + 1) % 6,
-        KeyCode::Up => app.contracts_state.focus = (app.contracts_state.focus + 5) % 6,
+        KeyCode::Down | KeyCode::Tab => {
+            app.contracts_state.focus = (app.contracts_state.focus + 1) % total
+        }
+        KeyCode::Up => app.contracts_state.focus = (app.contracts_state.focus + total - 1) % total,
         KeyCode::Enter => {
-            if app.contracts_state.focus == 5 {
+            if app.contracts_state.focus == submit {
                 submit_contract_call(app);
             } else {
-                app.contracts_state.focus = (app.contracts_state.focus + 1) % 6;
+                app.contracts_state.focus = (app.contracts_state.focus + 1) % total;
             }
         }
-        _ => match app.contracts_state.focus {
-            0 => input(&mut app.contracts_state.address_input, key),
-            1 => input(&mut app.contracts_state.method_input, key),
-            2 => input(&mut app.contracts_state.args_input, key),
-            3 => input(&mut app.contracts_state.value_input, key),
-            4 => input(&mut app.contracts_state.fee_input, key),
-            _ => {}
-        },
+        _ => input_focused(app, key),
     }
 }
 
@@ -38,10 +37,42 @@ fn input(input: &mut tui_input::Input, key: KeyEvent) {
     input.handle_event(&crossterm::event::Event::Key(key));
 }
 
+fn input_focused(app: &mut App, key: KeyEvent) {
+    let arg_count = visible_arg_count(app);
+    let value_idx = 2 + arg_count;
+    let fee_idx = value_idx + 1;
+    match app.contracts_state.focus {
+        0 => input(&mut app.contracts_state.address_input, key),
+        1 => input(&mut app.contracts_state.method_input, key),
+        idx if idx >= 2 && idx < value_idx => {
+            if app.contracts_state.arg_inputs.is_empty() {
+                input(&mut app.contracts_state.args_input, key);
+            } else if let Some(input_field) = app.contracts_state.arg_inputs.get_mut(idx - 2) {
+                input(input_field, key);
+            }
+        }
+        idx if idx == value_idx => input(&mut app.contracts_state.value_input, key),
+        idx if idx == fee_idx => input(&mut app.contracts_state.fee_input, key),
+        _ => {}
+    }
+}
+
+fn visible_arg_count(app: &App) -> usize {
+    app.contracts_state.arg_inputs.len().max(1)
+}
+
+fn contract_field_count(app: &App) -> usize {
+    visible_arg_count(app) + 5
+}
+
+fn submit_index(app: &App) -> usize {
+    contract_field_count(app) - 1
+}
+
 fn submit_contract_call(app: &mut App) {
+    refresh_abi_fields(app);
     let addr_str = app.contracts_state.address_input.value().trim();
     let method_str = app.contracts_state.method_input.value().trim();
-    let args_str = app.contracts_state.args_input.value().trim();
     let value_str = app.contracts_state.value_input.value().trim();
     let fee_str = app.contracts_state.fee_input.value().trim();
     push_log(&mut app.contracts_state.logs, "contract call requested");
@@ -77,7 +108,7 @@ fn submit_contract_call(app: &mut App) {
         &mut app.contracts_state.logs,
         format!("method resolved to id {method_idx}"),
     );
-    let args = match parse_args(args_str) {
+    let args = match parse_current_args(app) {
         Ok(args) => args,
         Err(err) => {
             app.contracts_state.result_msg = err;
@@ -207,7 +238,11 @@ fn submit_contract_call(app: &mut App) {
         app.contracts_state.address_input.reset();
         app.contracts_state.method_input.reset();
         app.contracts_state.args_input.reset();
-        app.contracts_state.focus = 0;
+        app.contracts_state.arg_inputs.clear();
+        app.contracts_state.arg_labels.clear();
+        app.contracts_state.arg_types.clear();
+        app.contracts_state.abi_signature = None;
+        app.contracts_state.focus = 5;
     } else {
         let error = result.error.unwrap_or_else(|| "unknown error".to_string());
         app.contracts_state.result_msg = format!("failed: {}", error);
@@ -216,6 +251,78 @@ fn submit_contract_call(app: &mut App) {
             format!("submit rejected: {error}"),
         );
     }
+}
+
+fn refresh_abi_fields(app: &mut App) {
+    let addr = app.contracts_state.address_input.value().trim();
+    let method = app.contracts_state.method_input.value().trim();
+    let Some(entry) = app.address_book.entries.get(addr) else {
+        clear_abi_fields(app);
+        return;
+    };
+    let Some((id, abi)) = entry
+        .abis
+        .iter()
+        .find(|(id, abi)| abi.name == method || id.as_str() == method)
+    else {
+        clear_abi_fields(app);
+        return;
+    };
+
+    let params = if abi.params.is_empty() {
+        (0..abi.args)
+            .map(|idx| (format!("arg{}", idx + 1), "u64".to_string()))
+            .collect::<Vec<_>>()
+    } else {
+        abi.params
+            .iter()
+            .map(|p| (p.name.clone(), p.ty.to_ascii_lowercase()))
+            .collect::<Vec<_>>()
+    };
+    let signature = format!(
+        "{addr}:{id}:{}",
+        params
+            .iter()
+            .map(|(name, ty)| format!("{name}:{ty}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if app.contracts_state.abi_signature.as_deref() == Some(signature.as_str()) {
+        return;
+    }
+    app.contracts_state.arg_labels = params.iter().map(|(name, _)| name.clone()).collect();
+    app.contracts_state.arg_types = params.iter().map(|(_, ty)| ty.clone()).collect();
+    app.contracts_state.arg_inputs = params.iter().map(|_| tui_input::Input::default()).collect();
+    app.contracts_state.abi_signature = Some(signature);
+}
+
+fn clear_abi_fields(app: &mut App) {
+    if app.contracts_state.abi_signature.is_some() {
+        app.contracts_state.arg_inputs.clear();
+        app.contracts_state.arg_labels.clear();
+        app.contracts_state.arg_types.clear();
+        app.contracts_state.abi_signature = None;
+    }
+}
+
+fn parse_current_args(app: &App) -> Result<Vec<Value>, String> {
+    if app.contracts_state.arg_inputs.is_empty() {
+        return parse_args(app.contracts_state.args_input.value().trim());
+    }
+
+    app.contracts_state
+        .arg_inputs
+        .iter()
+        .enumerate()
+        .map(|(idx, input)| {
+            let label = app.contracts_state.arg_labels[idx].as_str();
+            parse_typed_arg(
+                input.value().trim(),
+                app.contracts_state.arg_types[idx].as_str(),
+                label,
+            )
+        })
+        .collect()
 }
 
 fn parse_args(args_str: &str) -> Result<Vec<Value>, String> {
@@ -237,23 +344,46 @@ fn parse_args(args_str: &str) -> Result<Vec<Value>, String> {
     Ok(args)
 }
 
+fn parse_typed_arg(text: &str, ty: &str, label: &str) -> Result<Value, String> {
+    if text.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    match ty {
+        "u64" => text
+            .parse::<u64>()
+            .map(Value::U64)
+            .map_err(|_| format!("{label} must be a u64")),
+        "u256" => text
+            .parse::<U256>()
+            .map(Value::U256)
+            .map_err(|_| format!("{label} must be a u256")),
+        "address" => decode_hash(text)
+            .map(Value::Address)
+            .map_err(|_| format!("{label} must be a 32-byte address")),
+        "string" => Ok(Value::String(text.to_string())),
+        _ => Err(format!("unsupported type for {label}: {ty}")),
+    }
+}
+
 fn parse_u128(text: &str, label: &str) -> Result<u128, String> {
     text.parse::<u128>().map_err(|_| format!("invalid {label}"))
 }
 
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
+    refresh_abi_fields(app);
+    let arg_count = visible_arg_count(app);
+    let mut constraints = vec![Constraint::Length(3), Constraint::Length(3)];
+    constraints.extend((0..arg_count).map(|_| Constraint::Length(3)));
+    constraints.extend([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(5),
+        Constraint::Min(7),
+    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Min(7),
-        ])
+        .constraints(constraints)
         .split(area);
 
     let focused = Style::default()
@@ -285,25 +415,67 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     render_input(
         f,
         chunks[2],
-        " Args: 100, 0x... ",
-        app.contracts_state.args_input.value(),
+        if app.contracts_state.arg_inputs.is_empty() {
+            " Args: 100, 0x... "
+        } else {
+            " Argument "
+        },
+        if app.contracts_state.arg_inputs.is_empty() {
+            app.contracts_state.args_input.value()
+        } else {
+            app.contracts_state.arg_inputs[0].value()
+        },
         style(2),
     );
+    for idx in 1..arg_count {
+        render_input(
+            f,
+            chunks[2 + idx],
+            &format!(
+                " {} ({}) ",
+                app.contracts_state.arg_labels[idx], app.contracts_state.arg_types[idx]
+            ),
+            app.contracts_state.arg_inputs[idx].value(),
+            style(2 + idx),
+        );
+    }
+    if !app.contracts_state.arg_inputs.is_empty() {
+        let title = format!(
+            " {} ({}) ",
+            app.contracts_state.arg_labels[0], app.contracts_state.arg_types[0]
+        );
+        render_input(
+            f,
+            chunks[2],
+            &title,
+            app.contracts_state.arg_inputs[0].value(),
+            style(2),
+        );
+    }
+    let value_idx = 2 + arg_count;
+    let fee_idx = value_idx + 1;
+    let button_idx = submit_index(app);
     render_input(
         f,
-        chunks[3],
+        chunks[value_idx],
         " Coins to Send ",
         app.contracts_state.value_input.value(),
-        style(3),
+        field_style(
+            style(value_idx),
+            parse_u128(app.contracts_state.value_input.value().trim(), "value").is_ok(),
+        ),
     );
     render_input(
         f,
-        chunks[4],
+        chunks[fee_idx],
         " Mining Tip ",
         app.contracts_state.fee_input.value(),
-        style(4),
+        field_style(
+            style(fee_idx),
+            parse_u128(app.contracts_state.fee_input.value().trim(), "fee").is_ok(),
+        ),
     );
-    let btn_style = if app.contracts_state.focus == 5 {
+    let btn_style = if app.contracts_state.focus == button_idx {
         Style::default()
             .bg(Color::Cyan)
             .fg(Color::Black)
@@ -315,13 +487,13 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Paragraph::new(" [ EXECUTE CONTRACT CALL ] ")
             .block(Block::default().borders(Borders::ALL))
             .style(btn_style),
-        chunks[5],
+        chunks[button_idx],
     );
     f.render_widget(
         Paragraph::new(app.contracts_state.result_msg.clone())
             .block(Block::default().borders(Borders::ALL).title(" Result "))
             .style(Style::default().fg(Color::Green)),
-        chunks[6],
+        chunks[button_idx + 1],
     );
     f.render_widget(
         Paragraph::new(app.contracts_state.logs.join("\n"))
@@ -331,8 +503,16 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                     .title(" Live Contract Log "),
             )
             .style(Style::default().fg(Color::Cyan)),
-        chunks[7],
+        chunks[button_idx + 2],
     );
+}
+
+fn field_style(style: Style, valid: bool) -> Style {
+    if valid {
+        style
+    } else {
+        style.fg(Color::Red)
+    }
 }
 
 fn render_input(f: &mut Frame, area: Rect, title: &str, value: &str, style: Style) {
