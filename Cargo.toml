@@ -8,7 +8,7 @@ name = "coin"
 path = "src/lib.rs"
 
 [[bin]]
-name = "coin-node"
+name = "coin"
 path = "src/main.rs"
 
 [dependencies]
@@ -32,6 +32,10 @@ tower-http = { version = "0.5", features = ["cors"] }
 hashbrown = "=0.15.5"
 indexmap = "=2.7.1"
 idna_adapter = "=1.0.0"
+tower = { version = "0.5", features = ["util"] }
+ratatui = "0.28.1"
+crossterm = "0.28.1"
+tui-input = "0.10.1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(test)'] }

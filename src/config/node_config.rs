@@ -1,6 +1,6 @@
 use crate::crypto::Address;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -72,6 +72,15 @@ impl NodeConfig {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.data_dir.join("blocks"))?;
         std::fs::create_dir_all(self.data_dir.join("receipts"))?;
+        Ok(())
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
     }
 }

@@ -676,6 +676,11 @@ mod memory {
 mod state_and_objects {
     use super::*;
 
+    fn p64(code: &mut Vec<u8>, value: u64) {
+        code.push(Opcode::Push64 as u8);
+        code.extend_from_slice(&value.to_be_bytes());
+    }
+
     #[test]
     fn test_structs() {
         let mut db = MockStateDB::new();
@@ -844,6 +849,81 @@ mod state_and_objects {
         let res = vm.run();
         assert_eq!(res, ExitReason::Halt);
         assert_eq!(vm.stack, vec![Value::U64(10), Value::U64(42)]);
+    }
+
+    #[test]
+    fn test_persistent_map_round_trip_through_state() {
+        let mut db = MockStateDB::new();
+        let mut store = vec![Opcode::NewMap as u8, Opcode::StoreLocal as u8, 0];
+        p64(&mut store, 42);
+        p64(&mut store, 5);
+        store.extend_from_slice(&[Opcode::PushLocal as u8, 0, Opcode::MapSet as u8]);
+        store.extend_from_slice(&[Opcode::PushLocal as u8, 0, Opcode::SetState as u8, 9]);
+        let ctx = setup_ctx(store);
+        let env = setup_env();
+        let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
+        let res = vm.run();
+        assert_eq!(res, ExitReason::Halt);
+        drop(vm);
+        assert_eq!(
+            db.state.get(&([1u8; 32], 9)),
+            Some(&Value::Map(vec![(Value::U64(5), Value::U64(42))]))
+        );
+
+        let mut load = vec![Opcode::GetState as u8, 9, Opcode::StoreLocal as u8, 0];
+        p64(&mut load, 5);
+        load.extend_from_slice(&[
+            Opcode::PushLocal as u8,
+            0,
+            Opcode::MapGet as u8,
+            Opcode::Return as u8,
+        ]);
+        let ctx = setup_ctx(load);
+        let env = setup_env();
+        let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
+        let res = vm.run();
+        assert_eq!(res, ExitReason::Return(vec![Value::U64(42)]));
+    }
+
+    #[test]
+    fn test_persistent_array_round_trip_through_state() {
+        let mut db = MockStateDB::new();
+        let mut store = Vec::new();
+        p64(&mut store, 4);
+        store.extend_from_slice(&[Opcode::NewArray as u8, 0, 1, Opcode::StoreLocal as u8, 0]);
+        p64(&mut store, 77);
+        p64(&mut store, 2);
+        store.extend_from_slice(&[Opcode::PushLocal as u8, 0, Opcode::ArraySet as u8]);
+        store.extend_from_slice(&[Opcode::PushLocal as u8, 0, Opcode::SetState as u8, 10]);
+        let ctx = setup_ctx(store);
+        let env = setup_env();
+        let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
+        let res = vm.run();
+        assert_eq!(res, ExitReason::Halt);
+        drop(vm);
+        assert_eq!(
+            db.state.get(&([1u8; 32], 10)),
+            Some(&Value::Array(vec![
+                Value::U64(0),
+                Value::U64(0),
+                Value::U64(77),
+                Value::U64(0),
+            ]))
+        );
+
+        let mut load = vec![Opcode::GetState as u8, 10, Opcode::StoreLocal as u8, 0];
+        p64(&mut load, 2);
+        load.extend_from_slice(&[
+            Opcode::PushLocal as u8,
+            0,
+            Opcode::ArrayGet as u8,
+            Opcode::Return as u8,
+        ]);
+        let ctx = setup_ctx(load);
+        let env = setup_env();
+        let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
+        let res = vm.run();
+        assert_eq!(res, ExitReason::Return(vec![Value::U64(77)]));
     }
 }
 
@@ -1464,16 +1544,8 @@ mod raw_calls {
         let ctx = setup_ctx(vec![Opcode::CallRaw as u8]);
         let env = setup_env();
         let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
-        vm.stack.push(Value::U64(1000)); // gas
-        vm.stack.push(Value::Address([0; 32])); // addr
-        vm.stack.push(Value::U256(U256::ZERO)); // val
-        vm.stack.push(Value::U64(0)); // arg_off
-        vm.stack.push(Value::U64(0)); // arg_sz
-        vm.stack.push(Value::U64(0)); // ret_off
-        vm.stack.push(Value::U64(0)); // ret_sz
         let res = vm.run();
-        assert_eq!(res, ExitReason::Halt);
-        assert_eq!(vm.stack, vec![Value::U64(0)]);
+        assert_eq!(res, ExitReason::InvalidOpcode);
     }
 
     #[test]
@@ -1482,10 +1554,8 @@ mod raw_calls {
         let ctx = setup_ctx(vec![Opcode::CallDataLoad as u8]);
         let env = setup_env();
         let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
-        vm.stack.push(Value::U64(0)); // offset
         let res = vm.run();
-        assert_eq!(res, ExitReason::Halt);
-        assert_eq!(vm.stack, vec![Value::U256(U256::ZERO)]); // stubbed
+        assert_eq!(res, ExitReason::InvalidOpcode);
     }
 
     #[test]
@@ -1494,11 +1564,8 @@ mod raw_calls {
         let ctx = setup_ctx(vec![Opcode::ReturnDataCopy as u8]);
         let env = setup_env();
         let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
-        vm.stack.push(Value::U64(0)); // dst
-        vm.stack.push(Value::U64(0)); // src
-        vm.stack.push(Value::U64(0)); // len
         let res = vm.run();
-        assert_eq!(res, ExitReason::Halt); // stubbed
+        assert_eq!(res, ExitReason::InvalidOpcode);
     }
 
     test_op!(

@@ -3,7 +3,10 @@ use crate::storage::ChainStore;
 use crate::types::{Amount, StateDiff, Transaction};
 use crate::{Context, Env, ExitReason, LiteVM, StateDB, Value};
 
-use super::{decode_contract_blob, CallRequest, CallResult};
+use super::{
+    decode_contract_blob, decode_contract_call, CallRequest, CallResult, ContractBlob,
+    ContractCallKind, ContractCallPayload, MethodMeta,
+};
 use ethnum::U256;
 use std::collections::HashMap;
 
@@ -30,15 +33,41 @@ pub fn execute_contract_tx(
     diffs: &mut Vec<StateDiff>,
 ) -> anyhow::Result<VmExecution> {
     let contract = decode_contract_blob(&code)?;
+    let call = decode_contract_call(&tx.payload)?;
+    let meta = top_level_meta(&contract, &call)?.clone();
+    let entry = top_level_entry(&contract, call.method_idx)?;
+    anyhow::ensure!(meta.args == call.args.len(), "contract call arity mismatch");
+    anyhow::ensure!(
+        !call.is_static() || tx.value == 0,
+        "static contract calls cannot carry value"
+    );
+    anyhow::ensure!(
+        call.is_interface()
+            == matches!(
+                call.kind,
+                ContractCallKind::Interface | ContractCallKind::StaticInterface
+            ),
+        "call kind mismatch"
+    );
     let mut overlay = OverlayState::new(store);
     let ctx = Context {
         caller: tx.from,
         address: code_address,
-        value: U256::from(tx.value),
-        static_call: false,
+        value: if matches!(
+            call.kind,
+            ContractCallKind::StaticMethod | ContractCallKind::StaticInterface
+        ) {
+            U256::ZERO
+        } else {
+            U256::from(tx.value)
+        },
+        static_call: matches!(
+            call.kind,
+            ContractCallKind::StaticMethod | ContractCallKind::StaticInterface
+        ),
         metadata: contract.metadata,
         code: contract.code,
-        call_data: tx.payload.clone(),
+        call_data: Vec::new(),
         return_data: Vec::new(),
     };
     let env = Env {
@@ -49,8 +78,11 @@ pub fn execute_contract_tx(
         gas_price: U256::from(block.gas_price),
     };
     let mut vm = LiteVM::new(ctx, env, &mut overlay, tx.gas_limit);
+    vm.pc = entry;
+    vm.stack.extend(call.args);
     let exit_reason = vm.run();
     let success = matches!(exit_reason, ExitReason::Halt | ExitReason::Return(_));
+    let success = success && return_arity_matches(&exit_reason, meta.rets);
     let gas_used = tx.gas_limit.saturating_sub(vm.gas);
     let events = if success {
         vm.events.clone()
@@ -67,6 +99,38 @@ pub fn execute_contract_tx(
         gas_used,
         events,
     })
+}
+
+fn top_level_meta<'a>(
+    contract: &'a ContractBlob,
+    call: &ContractCallPayload,
+) -> anyhow::Result<&'a MethodMeta> {
+    let meta = match call.kind {
+        ContractCallKind::Method | ContractCallKind::StaticMethod => {
+            contract.metadata.methods.get(&call.method_idx)
+        }
+        ContractCallKind::Interface | ContractCallKind::StaticInterface => {
+            contract.metadata.interfaces.get(&call.method_idx)
+        }
+    };
+    meta.ok_or_else(|| anyhow::anyhow!("contract call target method not found"))
+}
+
+fn top_level_entry(contract: &ContractBlob, method_idx: u16) -> anyhow::Result<usize> {
+    contract
+        .metadata
+        .jump_table
+        .get(&method_idx)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("contract call target entry not found"))
+}
+
+fn return_arity_matches(exit: &ExitReason, rets: usize) -> bool {
+    match exit {
+        ExitReason::Halt => rets == 0,
+        ExitReason::Return(values) => values.len() == rets,
+        _ => false,
+    }
 }
 
 struct OverlayState<'a> {
@@ -165,6 +229,18 @@ impl StateDB for OverlayState<'_> {
             return Err(ExitReason::TypeError);
         }
 
+        let Some(entry) = contract
+            .metadata
+            .jump_table
+            .get(&request.method_idx)
+            .copied()
+        else {
+            return Ok(CallResult {
+                success: false,
+                return_values: Vec::new(),
+                gas_left: request.gas,
+            });
+        };
         let metadata = contract.metadata.clone();
         let code = contract.code;
         let writes_before = self.writes.clone();
@@ -183,11 +259,7 @@ impl StateDB for OverlayState<'_> {
             self,
             request.gas,
         );
-        vm.pc = metadata
-            .jump_table
-            .get(&request.method_idx)
-            .copied()
-            .unwrap_or(0);
+        vm.pc = entry;
         vm.stack.extend(request.args);
         let exit = vm.run();
         let gas_left = vm.gas;

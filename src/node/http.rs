@@ -20,6 +20,39 @@ pub struct NodeServer {
     pub seen_txs: HashSet<String>,
     pub seen_blocks: HashSet<String>,
     pub bad_peers: HashMap<String, Instant>,
+    pub mining: MiningStatus,
+}
+
+#[derive(Clone, Debug)]
+pub struct MiningStatus {
+    pub enabled: bool,
+    pub in_progress: bool,
+    pub last_height: u64,
+    pub last_hash: Option<String>,
+    pub last_error: Option<String>,
+    pub mined_blocks: u64,
+    pub logs: Vec<String>,
+}
+
+impl MiningStatus {
+    fn new(enabled: bool, height: u64) -> Self {
+        Self {
+            enabled,
+            in_progress: false,
+            last_height: height,
+            last_hash: None,
+            last_error: None,
+            mined_blocks: 0,
+            logs: vec![format!("miner initialized at height {height}")],
+        }
+    }
+
+    pub fn push_log(&mut self, msg: impl Into<String>) {
+        self.logs.push(msg.into());
+        if self.logs.len() > 12 {
+            self.logs.remove(0);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -46,12 +79,15 @@ pub struct HeaderAnnouncement {
 impl NodeServer {
     pub fn new(core: ChainCore) -> Self {
         let peers = core.cfg.peers.iter().cloned().collect();
+        let height = core.store.height().unwrap_or(0);
+        let mining = MiningStatus::new(core.cfg.mine, height);
         Self {
             core,
             peers,
             seen_txs: HashSet::new(),
             seen_blocks: HashSet::new(),
             bad_peers: HashMap::new(),
+            mining,
         }
     }
 
@@ -68,7 +104,14 @@ impl NodeServer {
 
 pub async fn serve(node: SharedNode) -> anyhow::Result<()> {
     let addr = node.lock().unwrap().core.cfg.listen_addr.clone();
-    let app = Router::new()
+    let app = router(node);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+pub fn router(node: SharedNode) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/height", get(height))
         .route("/peers", get(peers).post(announce_peer))
@@ -82,10 +125,7 @@ pub async fn serve(node: SharedNode) -> anyhow::Result<()> {
         .route("/account/:address", get(account_by_address))
         .route("/mempool", get(mempool))
         .layer(CorsLayer::permissive())
-        .with_state(node);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(node)
 }
 
 async fn health(State(node): State<SharedNode>) -> Json<HealthResponse> {

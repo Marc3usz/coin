@@ -1,4 +1,5 @@
 use super::Hash;
+use ethnum::U256;
 
 pub fn hash_leq_target(hash: &Hash, target: &Hash) -> bool {
     hash <= target
@@ -41,17 +42,14 @@ pub fn target_to_nbits(target: &Hash) -> u32 {
 
 pub fn scale_target(target: Hash, actual: u64, expected: u64) -> Hash {
     let actual = actual.clamp(expected / 4, expected * 4).max(1) as u128;
-    let expected = expected.max(1) as u128;
-    let mut out = [0u8; 32];
-    let mut carry = 0u128;
-    for (i, byte) in target.iter().rev().enumerate() {
-        let v = (*byte as u128) * actual + carry;
-        out[31 - i] = ((v / expected) & 0xff) as u8;
-        carry = (v % expected) << 8;
-    }
-    if carry > 0 {
-        [0xff; 32]
-    } else {
-        out
-    }
+    let expected = U256::from(expected.max(1) as u128);
+    let actual = U256::from(actual);
+    let target = U256::from_be_bytes(target);
+    let quotient = target / expected;
+    let remainder = target % expected;
+    let scaled = quotient
+        .checked_mul(actual)
+        .unwrap_or(U256::MAX)
+        .saturating_add((remainder * actual) / expected);
+    scaled.to_be_bytes()
 }

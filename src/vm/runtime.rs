@@ -14,6 +14,9 @@ pub enum Value {
     ArrayRef(u32),
     MapRef(u32),
     String(String),
+    Struct(Vec<Value>),
+    Array(Vec<Value>),
+    Map(Vec<(Value, Value)>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,6 +72,21 @@ pub enum CallKind {
     Delegate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContractCallKind {
+    Method,
+    StaticMethod,
+    Interface,
+    StaticInterface,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractCallPayload {
+    pub kind: ContractCallKind,
+    pub method_idx: u16,
+    pub args: Vec<Value>,
+}
+
 pub struct CallRequest {
     pub kind: CallKind,
     pub interface: bool,
@@ -90,6 +108,7 @@ pub struct CallResult {
 }
 
 const CONTRACT_BLOB_MAGIC: &[u8; 4] = b"LVM1";
+const CONTRACT_CALL_MAGIC: &[u8; 6] = b"LCALL1";
 
 pub fn encode_contract_blob(blob: &ContractBlob) -> anyhow::Result<Vec<u8>> {
     let metadata = bincode::serialize(&blob.metadata)?;
@@ -104,12 +123,10 @@ pub fn encode_contract_blob(blob: &ContractBlob) -> anyhow::Result<Vec<u8>> {
 }
 
 pub fn decode_contract_blob(bytes: &[u8]) -> anyhow::Result<ContractBlob> {
-    if bytes.len() < 8 || &bytes[..4] != CONTRACT_BLOB_MAGIC {
-        return Ok(ContractBlob {
-            metadata: Metadata::default(),
-            code: bytes.to_vec(),
-        });
-    }
+    anyhow::ensure!(
+        bytes.len() >= 8 && &bytes[..4] == CONTRACT_BLOB_MAGIC,
+        "contract bytecode must be LVM1"
+    );
 
     let metadata_len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let metadata_end = 8usize
@@ -120,6 +137,39 @@ pub fn decode_contract_blob(bytes: &[u8]) -> anyhow::Result<ContractBlob> {
         metadata: bincode::deserialize(&bytes[8..metadata_end])?,
         code: bytes[metadata_end..].to_vec(),
     })
+}
+
+pub fn encode_contract_call(call: &ContractCallPayload) -> anyhow::Result<Vec<u8>> {
+    let payload = bincode::serialize(call)?;
+    let mut out = Vec::with_capacity(CONTRACT_CALL_MAGIC.len() + payload.len());
+    out.extend_from_slice(CONTRACT_CALL_MAGIC);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+pub fn decode_contract_call(bytes: &[u8]) -> anyhow::Result<ContractCallPayload> {
+    anyhow::ensure!(
+        bytes.len() >= CONTRACT_CALL_MAGIC.len()
+            && &bytes[..CONTRACT_CALL_MAGIC.len()] == CONTRACT_CALL_MAGIC,
+        "contract call payload must be LCALL1"
+    );
+    Ok(bincode::deserialize(&bytes[CONTRACT_CALL_MAGIC.len()..])?)
+}
+
+impl ContractCallPayload {
+    pub fn is_static(&self) -> bool {
+        matches!(
+            self.kind,
+            ContractCallKind::StaticMethod | ContractCallKind::StaticInterface
+        )
+    }
+
+    pub fn is_interface(&self) -> bool {
+        matches!(
+            self.kind,
+            ContractCallKind::Interface | ContractCallKind::StaticInterface
+        )
+    }
 }
 
 pub struct Arena {
@@ -308,6 +358,120 @@ impl<'a> LiteVM<'a> {
             }
         }
         Ok(())
+    }
+
+    fn materialize_state_value(&self, value: Value) -> Result<Value, ExitReason> {
+        match value {
+            Value::Ref(id) => match self.arena.objects.get(id as usize) {
+                Some(HeapObject::Struct(fields)) => fields
+                    .iter()
+                    .cloned()
+                    .map(|value| self.materialize_state_value(value))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Struct),
+                _ => Err(ExitReason::TypeError),
+            },
+            Value::ArrayRef(id) => match self.arena.objects.get(id as usize) {
+                Some(HeapObject::Array(values)) => values
+                    .iter()
+                    .cloned()
+                    .map(|value| self.materialize_state_value(value))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Array),
+                _ => Err(ExitReason::TypeError),
+            },
+            Value::MapRef(id) => match self.arena.objects.get(id as usize) {
+                Some(HeapObject::Map(entries)) => {
+                    let mut entries = entries
+                        .iter()
+                        .map(|(key, value)| {
+                            Ok((
+                                self.materialize_state_value(key.clone())?,
+                                self.materialize_state_value(value.clone())?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Self::sort_map_entries(&mut entries)?;
+                    Ok(Value::Map(entries))
+                }
+                _ => Err(ExitReason::TypeError),
+            },
+            Value::Struct(fields) => fields
+                .into_iter()
+                .map(|value| self.materialize_state_value(value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Struct),
+            Value::Array(values) => values
+                .into_iter()
+                .map(|value| self.materialize_state_value(value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            Value::Map(entries) => {
+                let mut entries = entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            self.materialize_state_value(key)?,
+                            self.materialize_state_value(value)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::sort_map_entries(&mut entries)?;
+                Ok(Value::Map(entries))
+            }
+            scalar => Ok(scalar),
+        }
+    }
+
+    fn sort_map_entries(entries: &mut [(Value, Value)]) -> Result<(), ExitReason> {
+        let mut keyed = entries
+            .iter()
+            .cloned()
+            .map(|entry| {
+                let key_bytes = bincode::serialize(&entry.0).map_err(|_| ExitReason::TypeError)?;
+                let value_bytes =
+                    bincode::serialize(&entry.1).map_err(|_| ExitReason::TypeError)?;
+                Ok((key_bytes, value_bytes, entry))
+            })
+            .collect::<Result<Vec<_>, ExitReason>>()?;
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (slot, (_, _, entry)) in entries.iter_mut().zip(keyed) {
+            *slot = entry;
+        }
+        Ok(())
+    }
+
+    fn hydrate_state_value(&mut self, value: Value) -> Result<Value, ExitReason> {
+        match value {
+            Value::Struct(fields) => {
+                let fields = fields
+                    .into_iter()
+                    .map(|value| self.hydrate_state_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = self.arena.alloc(HeapObject::Struct(fields))?;
+                Ok(Value::Ref(id))
+            }
+            Value::Array(values) => {
+                let values = values
+                    .into_iter()
+                    .map(|value| self.hydrate_state_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = self.arena.alloc(HeapObject::Array(values))?;
+                Ok(Value::ArrayRef(id))
+            }
+            Value::Map(entries) => {
+                let mut map = HashMap::new();
+                for (key, value) in entries {
+                    map.insert(
+                        self.hydrate_state_value(key)?,
+                        self.hydrate_state_value(value)?,
+                    );
+                }
+                let id = self.arena.alloc(HeapObject::Map(map))?;
+                Ok(Value::MapRef(id))
+            }
+            scalar => Ok(scalar),
+        }
     }
 
     pub fn step(&mut self) -> Result<(), ExitReason> {
@@ -912,6 +1076,7 @@ impl<'a> LiteVM<'a> {
                 self.require_gas(100)?;
                 let field_idx = self.read_u8()?;
                 let val = self.state_db.get_state(&self.ctx.address, field_idx);
+                let val = self.hydrate_state_value(val)?;
                 self.push(val);
             }
             Opcode::SetState => {
@@ -921,6 +1086,7 @@ impl<'a> LiteVM<'a> {
                 }
                 let field_idx = self.read_u8()?;
                 let val = self.pop()?;
+                let val = self.materialize_state_value(val)?;
                 self.state_db.set_state(&self.ctx.address, field_idx, val)?;
             }
             Opcode::NewMap => {
@@ -1256,52 +1422,13 @@ impl<'a> LiteVM<'a> {
                 }
             }
             Opcode::CallRaw => {
-                self.require_gas(700)?;
-                let _ret_sz = self.pop_u64()?;
-                let _ret_off = self.pop_u64()?;
-                let _arg_sz = self.pop_u64()?;
-                let _arg_off = self.pop_u64()?;
-                let _val = self.pop_u256()?;
-                let _addr = self.pop_address()?;
-                let _gas = self.pop_u64()?;
-                self.push(Value::U64(0));
+                return Err(ExitReason::InvalidOpcode);
             }
             Opcode::CallDataLoad => {
-                self.require_gas(4)?;
-                let offset = self.pop()?;
-                if let Value::U64(off) = offset {
-                    let start = off as usize;
-                    let mut buf = [0u8; 32];
-                    if start < self.ctx.call_data.len() {
-                        let available = (self.ctx.call_data.len() - start).min(32);
-                        buf[..available]
-                            .copy_from_slice(&self.ctx.call_data[start..start + available]);
-                    }
-                    self.push(Value::U256(U256::from_be_bytes(buf)));
-                } else {
-                    return Err(ExitReason::TypeError);
-                }
+                return Err(ExitReason::InvalidOpcode);
             }
             Opcode::ReturnDataCopy => {
-                self.require_gas(3)?;
-                let len = self.pop()?;
-                let src = self.pop()?;
-                let dst = self.pop()?;
-                if let (Value::U64(l), Value::U64(s), Value::U64(d)) = (len, src, dst) {
-                    let l = l as usize;
-                    let s = s as usize;
-                    let d = d as usize;
-                    let src_end = Self::checked_range_end(s, l)?;
-                    let dst_end = Self::checked_range_end(d, l)?;
-                    if src_end > self.ctx.return_data.len() {
-                        return Err(ExitReason::OutOfBounds);
-                    }
-                    self.arena.ensure_raw_len(dst_end)?;
-                    self.arena.raw_memory[d..dst_end]
-                        .copy_from_slice(&self.ctx.return_data[s..src_end]);
-                } else {
-                    return Err(ExitReason::TypeError);
-                }
+                return Err(ExitReason::InvalidOpcode);
             }
             Opcode::Invalid => return Err(ExitReason::InvalidOpcode),
         }

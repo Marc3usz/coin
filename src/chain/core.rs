@@ -6,7 +6,7 @@ use crate::crypto::{
 use crate::mempool::Mempool;
 use crate::storage::ChainStore;
 use crate::types::*;
-use crate::vm::{execute_contract_tx, VmBlockContext};
+use crate::vm::{decode_contract_blob, execute_contract_tx, VmBlockContext};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct ChainCore {
@@ -119,6 +119,7 @@ impl ChainCore {
                 !tx.payload.is_empty(),
                 "contract bytecode must be non-empty"
             );
+            decode_contract_blob(&tx.payload)?;
         }
         anyhow::ensure!(
             !tx_expired_at(tx, self.store.height()?),
@@ -373,6 +374,7 @@ impl ChainCore {
                         !tx.payload.is_empty(),
                         "contract bytecode must be non-empty"
                     );
+                    decode_contract_blob(&tx.payload)?;
                     let code_hash = sha3_256(&tx.payload);
                     let contract = contract_address(&tx.from, tx.account_index);
                     let mut acct = self.store.get_account(&contract)?;
@@ -488,11 +490,15 @@ impl ChainCore {
     }
 
     fn next_nbits(&self, parent: &Block) -> anyhow::Result<u32> {
-        if parent.header.height == 0 || !(parent.header.height + 1).is_multiple_of(RETARGET_BLOCKS)
-        {
+        if parent.header.height == 0 || (parent.header.height + 1) % RETARGET_BLOCKS != 0 {
             return Ok(parent.header.nbits);
         }
-        let start_height = parent.header.height + 1 - RETARGET_BLOCKS;
+        let mut start_height = parent.header.height + 1 - RETARGET_BLOCKS;
+        if start_height == 0 && parent.header.height > 1 {
+            // Genesis has a fixed timestamp for deterministic chain identity; do not let
+            // wall-clock time since genesis distort the first live retarget window.
+            start_height = 1;
+        }
         let start = self
             .store
             .get_block_by_height(start_height)?
@@ -502,7 +508,12 @@ impl ChainCore {
             .timestamp
             .saturating_sub(start.header.timestamp)
             .max(1);
-        let expected = RETARGET_BLOCKS * TARGET_BLOCK_SECONDS;
+        let intervals = parent
+            .header
+            .height
+            .saturating_sub(start.header.height)
+            .max(1);
+        let expected = intervals * TARGET_BLOCK_SECONDS;
         Ok(target_to_nbits(&scale_target(
             nbits_to_target(parent.header.nbits),
             actual,

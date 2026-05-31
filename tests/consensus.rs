@@ -1,6 +1,9 @@
 use coin::chain::{contract_address, ChainCore};
 use coin::config::NodeConfig;
-use coin::crypto::{address_from_public_key, hash_leq_target, hex_hash, nbits_to_target, sha3_256};
+use coin::crypto::{
+    address_from_public_key, hash_leq_target, hex_hash, nbits_to_target, scale_target, sha3_256,
+    target_to_nbits,
+};
 use coin::mempool::Mempool;
 use coin::types::{
     block_reward, genesis_header, next_gas_price, receipt_root, tx_root, Account, Block,
@@ -8,7 +11,10 @@ use coin::types::{
     MIN_GAS_PRICE, PROTOCOL_VERSION, TAIL_REWARD,
 };
 use coin::wallet::{sign_tx, WalletFile};
-use coin::{encode_contract_blob, ContractBlob, Metadata, MethodMeta, Opcode, Value};
+use coin::{
+    encode_contract_blob, encode_contract_call, ContractBlob, ContractCallKind,
+    ContractCallPayload, Metadata, MethodMeta, Opcode, Value,
+};
 use ethnum::U256;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -231,33 +237,50 @@ fn immediate_u16(code: &mut Vec<u8>, value: u16) {
     code.extend_from_slice(&value.to_be_bytes());
 }
 
-fn set_state_from_calldata_contract(field: u8) -> Vec<u8> {
-    let mut code = Vec::new();
-    push64(&mut code, 0);
-    code.push(Opcode::CallDataLoad as u8);
-    code.push(Opcode::Cast256ToAddr as u8);
-    code.push(Opcode::SetState as u8);
-    code.push(field);
-    code.push(Opcode::Stop as u8);
+fn call_payload(kind: ContractCallKind, method_idx: u16, args: Vec<Value>) -> Vec<u8> {
+    encode_contract_call(&ContractCallPayload {
+        kind,
+        method_idx,
+        args,
+    })
+    .unwrap()
+}
+
+fn set_state_contract(field: u8) -> Vec<u8> {
+    let mut metadata = Metadata::default();
+    metadata.methods.insert(1, MethodMeta { args: 1, rets: 0 });
+    metadata.jump_table.insert(1, 0);
     encode_contract_blob(&ContractBlob {
-        metadata: Metadata::default(),
-        code,
+        metadata,
+        code: vec![Opcode::SetState as u8, field, Opcode::Stop as u8],
     })
     .unwrap()
 }
 
 fn reverting_after_write_contract(field: u8) -> Vec<u8> {
+    let mut metadata = Metadata::default();
+    metadata.methods.insert(1, MethodMeta { args: 1, rets: 0 });
+    metadata.jump_table.insert(1, 0);
     let mut code = Vec::new();
-    push64(&mut code, 0);
-    code.push(Opcode::CallDataLoad as u8);
-    code.push(Opcode::Cast256ToAddr as u8);
     code.push(Opcode::SetState as u8);
     code.push(field);
     push64(&mut code, 1);
     code.push(Opcode::Revert as u8);
+    encode_contract_blob(&ContractBlob { metadata, code }).unwrap()
+}
+
+fn cast_address_contract(field: u8) -> Vec<u8> {
+    let mut metadata = Metadata::default();
+    metadata.methods.insert(1, MethodMeta { args: 1, rets: 0 });
+    metadata.jump_table.insert(1, 0);
     encode_contract_blob(&ContractBlob {
-        metadata: Metadata::default(),
-        code,
+        metadata,
+        code: vec![
+            Opcode::CastAddrTo256 as u8,
+            Opcode::SetState as u8,
+            field,
+            Opcode::Stop as u8,
+        ],
     })
     .unwrap()
 }
@@ -280,16 +303,19 @@ fn nft_target_contract(has_interface: bool) -> Vec<u8> {
 
 fn interface_mint_caller_contract(target: [u8; 32]) -> Vec<u8> {
     let mut metadata = Metadata::default();
+    metadata.methods.insert(1, MethodMeta { args: 1, rets: 0 });
     metadata
         .interfaces
         .insert(1, MethodMeta { args: 1, rets: 0 });
+    metadata.jump_table.insert(1, 0);
     let mut code = Vec::new();
+    code.push(Opcode::StoreLocal as u8);
+    code.push(0);
     push64(&mut code, 100_000);
     push_addr(&mut code, target);
     push256(&mut code, U256::ZERO);
-    push64(&mut code, 0);
-    code.push(Opcode::CallDataLoad as u8);
-    code.push(Opcode::Cast256ToAddr as u8);
+    code.push(Opcode::PushLocal as u8);
+    code.push(0);
     code.push(Opcode::InvokeInterface as u8);
     immediate_u16(&mut code, 1);
     code.push(Opcode::SetState as u8);
@@ -300,15 +326,18 @@ fn interface_mint_caller_contract(target: [u8; 32]) -> Vec<u8> {
 
 fn static_interface_caller_contract(target: [u8; 32]) -> Vec<u8> {
     let mut metadata = Metadata::default();
+    metadata.methods.insert(1, MethodMeta { args: 1, rets: 0 });
     metadata
         .interfaces
         .insert(1, MethodMeta { args: 1, rets: 0 });
+    metadata.jump_table.insert(1, 0);
     let mut code = Vec::new();
+    code.push(Opcode::StoreLocal as u8);
+    code.push(0);
     push64(&mut code, 100_000);
     push_addr(&mut code, target);
-    push64(&mut code, 0);
-    code.push(Opcode::CallDataLoad as u8);
-    code.push(Opcode::Cast256ToAddr as u8);
+    code.push(Opcode::PushLocal as u8);
+    code.push(0);
     code.push(Opcode::InvokeItfStatic as u8);
     immediate_u16(&mut code, 1);
     code.push(Opcode::SetState as u8);
@@ -432,6 +461,33 @@ fn reward_halves_to_tail_emission() {
 fn compact_nbits_easy_is_easy_enough_for_genesis_mvp() {
     let target = nbits_to_target(0x20ffffff);
     assert!(hash_leq_target(&[0; 32], &target));
+}
+
+#[test]
+fn scale_target_tightens_and_relaxes_predictably() {
+    let initial = nbits_to_target(0x20ffffff);
+    assert_eq!(target_to_nbits(&scale_target(initial, 1, 4)), 0x203fffff);
+    assert_eq!(target_to_nbits(&scale_target(initial, 4, 1)), 0x20ffffff);
+}
+
+#[test]
+fn retarget_tightens_when_blocks_are_too_fast() {
+    let mut core = ChainCore::open(test_config("retarget-fast-blocks")).unwrap();
+    let initial = core.head().unwrap().header.nbits;
+    assert_eq!(initial, 0x20ffffff);
+
+    for _ in 0..128 {
+        core.mine_next_block([0x44; 32]).unwrap();
+    }
+
+    let head = core.head().unwrap();
+    assert_eq!(head.header.height, 128);
+    assert_eq!(head.header.nbits, 0x203fffff);
+    assert!(
+        nbits_to_target(head.header.nbits) < nbits_to_target(initial),
+        "fast retarget should lower target: initial=0x{initial:08x}, actual=0x{:08x}",
+        head.header.nbits
+    );
 }
 
 #[test]
@@ -739,6 +795,22 @@ fn submit_tx_rejects_empty_contract_deployment() {
 }
 
 #[test]
+fn submit_tx_rejects_non_lvm1_contract_deployment() {
+    let mut core = ChainCore::open(test_config("raw-deploy-submit")).unwrap();
+    let wallet = WalletFile::generate();
+    fund(&mut core, &wallet, 2_000_000);
+
+    let tx = signed_tx(&core, &wallet, None, 0, vec![Opcode::Stop as u8], 0, 1);
+    let result = core.submit_tx(tx, 0);
+
+    assert!(!result.accepted);
+    assert!(result
+        .error
+        .unwrap()
+        .contains("contract bytecode must be LVM1"));
+}
+
+#[test]
 fn end_to_end_contract_deploy_call_revert_refunds_and_preserves_state() {
     let mut core = ChainCore::open(test_config("e2e-contract-state")).unwrap();
     make_head_easy_to_mine(&mut core);
@@ -749,7 +821,7 @@ fn end_to_end_contract_deploy_call_revert_refunds_and_preserves_state() {
     let bob = [0x63; 32];
     fund(&mut core, &wallet, 2_000_000_000);
 
-    let deploy_payload = set_state_from_calldata_contract(0);
+    let deploy_payload = set_state_contract(0);
     let contract = contract_address(&sender, 0);
     let deploy = signed_tx(&core, &wallet, None, 777, deploy_payload.clone(), 0, 1);
     submit_and_mine(&mut core, deploy, miner);
@@ -765,7 +837,15 @@ fn end_to_end_contract_deploy_call_revert_refunds_and_preserves_state() {
         deploy_payload
     );
 
-    let call = signed_tx(&core, &wallet, Some(contract), 0, alice.to_vec(), 1, 2);
+    let call = signed_tx(
+        &core,
+        &wallet,
+        Some(contract),
+        0,
+        call_payload(ContractCallKind::Method, 1, vec![Value::Address(alice)]),
+        1,
+        2,
+    );
     let call_block = submit_and_mine(&mut core, call, miner);
     let receipts = core
         .store
@@ -790,7 +870,7 @@ fn end_to_end_contract_deploy_call_revert_refunds_and_preserves_state() {
         &wallet,
         Some(reverting_contract),
         failed_value,
-        bob.to_vec(),
+        call_payload(ContractCallKind::Method, 1, vec![Value::Address(bob)]),
         3,
         4,
     );
@@ -815,6 +895,89 @@ fn end_to_end_contract_deploy_call_revert_refunds_and_preserves_state() {
         core.store.get_account(&sender).unwrap().balance,
         before_sender - 17 - failed_receipts.receipts[0].gas_burned
     );
+}
+
+#[test]
+fn end_to_end_contract_call_rejects_structurally_invalid_lcall1() {
+    let mut core = ChainCore::open(test_config("e2e-bad-lcall")).unwrap();
+    make_head_easy_to_mine(&mut core);
+    let wallet = WalletFile::generate();
+    let sender = wallet.address().unwrap();
+    let miner = [0x64; 32];
+    fund(&mut core, &wallet, 2_000_000_000);
+
+    let contract = contract_address(&sender, 0);
+    let deploy = signed_tx(&core, &wallet, None, 0, cast_address_contract(0), 0, 1);
+    submit_and_mine(&mut core, deploy, miner);
+
+    let raw_payload = signed_tx(&core, &wallet, Some(contract), 0, vec![1, 2, 3], 1, 2);
+    let result = core.submit_tx(raw_payload, 1);
+    assert!(result.accepted, "submit failed: {:?}", result.error);
+    let err = core.mine_next_block(miner).unwrap_err().to_string();
+    assert!(
+        err.contains("contract call payload must be LCALL1"),
+        "err was: {err}"
+    );
+    assert_eq!(core.store.get_account(&sender).unwrap().account_index, 1);
+    assert_eq!(core.store.get_vm_state_value(&contract, 0), Value::U64(0));
+
+    core.mempool = Mempool::default();
+    let missing_method = signed_tx(
+        &core,
+        &wallet,
+        Some(contract),
+        0,
+        call_payload(
+            ContractCallKind::Method,
+            9,
+            vec![Value::Address([0x65; 32])],
+        ),
+        1,
+        3,
+    );
+    let result = core.submit_tx(missing_method, 1);
+    assert!(result.accepted, "submit failed: {:?}", result.error);
+    let err = core.mine_next_block(miner).unwrap_err().to_string();
+    assert!(
+        err.contains("contract call target method not found"),
+        "err was: {err}"
+    );
+    assert_eq!(core.store.get_account(&sender).unwrap().account_index, 1);
+}
+
+#[test]
+fn end_to_end_contract_runtime_type_error_is_receipted_failure() {
+    let mut core = ChainCore::open(test_config("e2e-runtime-type-error")).unwrap();
+    make_head_easy_to_mine(&mut core);
+    let wallet = WalletFile::generate();
+    let sender = wallet.address().unwrap();
+    let miner = [0x66; 32];
+    fund(&mut core, &wallet, 2_000_000_000);
+
+    let contract = contract_address(&sender, 0);
+    let deploy = signed_tx(&core, &wallet, None, 0, cast_address_contract(0), 0, 1);
+    submit_and_mine(&mut core, deploy, miner);
+
+    let bad_arg = signed_tx(
+        &core,
+        &wallet,
+        Some(contract),
+        0,
+        call_payload(ContractCallKind::Method, 1, vec![Value::U64(123)]),
+        1,
+        2,
+    );
+    let block = submit_and_mine(&mut core, bad_arg, miner);
+    let receipts = core
+        .store
+        .get_receipts(&block.hash().unwrap())
+        .unwrap()
+        .unwrap();
+
+    assert!(!receipts.receipts[0].success);
+    assert!(receipts.receipts[0].exit_reason.contains("TypeError"));
+    assert_eq!(core.store.get_vm_state_value(&contract, 0), Value::U64(0));
+    assert_eq!(core.store.get_account(&sender).unwrap().account_index, 2);
 }
 
 #[test]
@@ -844,7 +1007,15 @@ fn end_to_end_deployed_interface_call_executes_nested_vm_and_handles_missing_int
     );
     submit_and_mine(&mut core, deploy_caller, miner);
 
-    let call_tx = signed_tx(&core, &wallet, Some(caller), 0, alice.to_vec(), 2, 3);
+    let call_tx = signed_tx(
+        &core,
+        &wallet,
+        Some(caller),
+        0,
+        call_payload(ContractCallKind::Method, 1, vec![Value::Address(alice)]),
+        2,
+        3,
+    );
     let call_block = submit_and_mine(&mut core, call_tx, miner);
     let receipts = core
         .store
@@ -874,7 +1045,15 @@ fn end_to_end_deployed_interface_call_executes_nested_vm_and_handles_missing_int
     );
     submit_and_mine(&mut core, deploy_bad_caller, miner);
 
-    let bad_call_tx = signed_tx(&core, &wallet, Some(bad_caller), 0, bob.to_vec(), 5, 6);
+    let bad_call_tx = signed_tx(
+        &core,
+        &wallet,
+        Some(bad_caller),
+        0,
+        call_payload(ContractCallKind::Method, 1, vec![Value::Address(bob)]),
+        5,
+        6,
+    );
     let bad_call_block = submit_and_mine(&mut core, bad_call_tx, miner);
     let bad_receipts = core
         .store
@@ -940,7 +1119,15 @@ fn end_to_end_contract_edge_cases_reject_non_contract_calls_and_static_writes() 
     );
     submit_and_mine(&mut core, deploy_static_caller, miner);
 
-    let static_call = signed_tx(&core, &wallet, Some(static_caller), 0, alice.to_vec(), 2, 4);
+    let static_call = signed_tx(
+        &core,
+        &wallet,
+        Some(static_caller),
+        0,
+        call_payload(ContractCallKind::Method, 1, vec![Value::Address(alice)]),
+        2,
+        4,
+    );
     let block = submit_and_mine(&mut core, static_call, miner);
     let receipts = core
         .store
