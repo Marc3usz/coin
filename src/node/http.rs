@@ -74,7 +74,8 @@ impl MiningStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
-    pub node_id: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
     pub chain_id: u64,
     pub height: u64,
     pub head: String,
@@ -332,10 +333,29 @@ async fn scan_lan_for_peers(node: &SharedNode, client: &reqwest::Client) {
             let Ok(res) = client.get(format!("{base}/health")).send().await else {
                 return;
             };
+            if !res.status().is_success() {
+                return;
+            }
             let Ok(health) = res.json::<HealthResponse>().await else {
+                node.lock()
+                    .unwrap()
+                    .push_discovery_log(format!("LAN scan saw {peer} but /health was invalid"));
                 return;
             };
-            if !health.ok || health.node_id == self_id || health.chain_id != chain_id {
+            if !health.ok {
+                return;
+            }
+            if health.node_id.as_deref() == Some(self_id.as_str()) {
+                node.lock()
+                    .unwrap()
+                    .push_discovery_log(format!("LAN scan ignored self {peer}"));
+                return;
+            }
+            if health.chain_id != chain_id {
+                node.lock().unwrap().push_discovery_log(format!(
+                    "LAN scan rejected {peer}: wrong chain id {}",
+                    health.chain_id
+                ));
                 return;
             }
             if health.genesis != self_genesis {
@@ -358,6 +378,10 @@ async fn scan_lan_for_peers(node: &SharedNode, client: &reqwest::Client) {
         node.lock()
             .unwrap()
             .push_discovery_log(format!("LAN scan probing {spawned} candidates"));
+    } else {
+        node.lock()
+            .unwrap()
+            .push_discovery_log("LAN scan had no new candidates".to_string());
     }
 }
 
@@ -380,7 +404,7 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
             return;
         }
     };
-    if health.node_id == node.lock().unwrap().discovery_id {
+    if health.node_id.as_deref() == Some(node.lock().unwrap().discovery_id.as_str()) {
         let mut node = node.lock().unwrap();
         node.peers.remove(&peer);
         node.discovered_peers.remove(&peer);
@@ -691,7 +715,7 @@ async fn health(State(node): State<SharedNode>) -> Json<HealthResponse> {
     let genesis = genesis_hash(&node).unwrap_or_else(|_| "unknown".to_string());
     Json(HealthResponse {
         ok: true,
-        node_id: node.discovery_id.clone(),
+        node_id: Some(node.discovery_id.clone()),
         chain_id: node.core.cfg.chain_id,
         height: node.core.store.height().unwrap_or(0),
         head: hex_hash(&head),
