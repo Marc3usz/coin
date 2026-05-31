@@ -10,13 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::cors::CorsLayer;
 
 pub type SharedNode = Arc<Mutex<NodeServer>>;
 
 pub struct NodeServer {
     pub core: ChainCore,
+    pub discovery_id: String,
     pub peers: HashSet<String>,
     pub discovered_peers: HashSet<String>,
     pub discovery_logs: Vec<String>,
@@ -86,6 +87,7 @@ impl NodeServer {
         let mining = MiningStatus::new(core.cfg.mine, height);
         Self {
             core,
+            discovery_id: new_discovery_id(),
             peers,
             discovered_peers: HashSet::new(),
             discovery_logs: vec!["LAN discovery ready".to_string()],
@@ -117,6 +119,7 @@ impl NodeServer {
 #[derive(Debug, Serialize, Deserialize)]
 struct LanAnnouncement {
     magic: String,
+    node_id: String,
     chain_id: u64,
     port: u16,
     height: u64,
@@ -164,6 +167,7 @@ async fn announce_lan(socket: &tokio::net::UdpSocket, node: &SharedNode) {
         };
         LanAnnouncement {
             magic: LAN_DISCOVERY_MAGIC.to_string(),
+            node_id: node.discovery_id.clone(),
             chain_id: node.core.cfg.chain_id,
             port,
             height: node.core.store.height().unwrap_or(0),
@@ -185,10 +189,7 @@ fn handle_lan_packet(node: &SharedNode, bytes: &[u8], from: SocketAddr) {
     }
     let peer = normalize_peer_url(&format!("{}:{}", from.ip(), msg.port));
     let mut node = node.lock().unwrap();
-    if msg.chain_id != node.core.cfg.chain_id {
-        return;
-    }
-    if listen_port(&node.core.cfg.listen_addr) == Some(msg.port) {
+    if msg.node_id == node.discovery_id || msg.chain_id != node.core.cfg.chain_id {
         return;
     }
     let is_new = node.peers.insert(peer.clone());
@@ -196,6 +197,14 @@ fn handle_lan_packet(node: &SharedNode, bytes: &[u8], from: SocketAddr) {
     if is_new {
         node.push_discovery_log(format!("discovered {peer} at height {}", msg.height));
     }
+}
+
+fn new_discovery_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
 }
 
 fn listen_port(listen_addr: &str) -> Option<u16> {
