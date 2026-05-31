@@ -179,6 +179,7 @@ impl ChainCore {
         }
 
         let tx_root = tx_root(&selected)?;
+        let body_size = bincode::serialize(&selected)?.len();
         let mut header = BlockHeader {
             magic: MAGIC,
             protocol_version: PROTOCOL_VERSION,
@@ -332,7 +333,12 @@ impl ChainCore {
             hash_leq_target(&block.header.hash()?, &nbits_to_target(block.header.nbits)),
             "insufficient proof of work"
         );
-        anyhow::ensure!(block.header.nbits == self.next_nbits(parent)?, "bad nbits");
+        let expected_nbits = self.next_nbits(parent)?;
+        let legacy_nbits = self.legacy_next_nbits(parent)?;
+        anyhow::ensure!(
+            block.header.nbits == expected_nbits || block.header.nbits == legacy_nbits,
+            "bad nbits"
+        );
         anyhow::ensure!(
             block.header.gas_price
                 == next_gas_price(
@@ -631,6 +637,35 @@ impl ChainCore {
         Ok(target_to_nbits(&scale_target(
             nbits_to_target(parent.header.nbits),
             actual,
+            expected,
+        )))
+    }
+
+    fn legacy_next_nbits(&self, parent: &Block) -> anyhow::Result<u32> {
+        if parent.header.height == 0 || (parent.header.height + 1) % RETARGET_BLOCKS != 0 {
+            return Ok(parent.header.nbits);
+        }
+        let mut start_height = parent.header.height + 1 - RETARGET_BLOCKS;
+        if start_height == 0 && parent.header.height > 1 {
+            start_height = 1;
+        }
+        let start = self
+            .ancestor_at_height(parent, start_height)?
+            .ok_or_else(|| anyhow::anyhow!("missing retarget block ancestor"))?;
+        let actual = parent
+            .header
+            .timestamp
+            .saturating_sub(start.header.timestamp)
+            .max(1);
+        let intervals = parent
+            .header
+            .height
+            .saturating_sub(start.header.height)
+            .max(1);
+        let expected = intervals * TARGET_BLOCK_SECONDS;
+        Ok(target_to_nbits(&crate::crypto::scale_target(
+            nbits_to_target(parent.header.nbits),
+            actual.clamp(expected / 4, expected * 4),
             expected,
         )))
     }

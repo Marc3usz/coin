@@ -984,6 +984,7 @@ async fn fetch_announced_block(node: SharedNode, from: String, hash: String) {
             }
         }
     };
+    retry_orphans(&node);
     if let Some((peers, from)) = accepted {
         tokio::spawn(async move { gossip_block(peers, from, block_for_gossip).await });
     }
@@ -1009,10 +1010,18 @@ async fn fetch_block_by_hash_once(
     let Ok(block) = res.json::<Block>().await else {
         return;
     };
-    let mut node = node.lock().unwrap();
-    if node.core.accept_block(block).is_ok() {
-        node.seen_blocks.insert(hash_hex.clone());
-        node.push_discovery_log(format!("fetched missing parent {hash_hex}"));
+    let accepted = {
+        let mut node = node.lock().unwrap();
+        if node.core.accept_block(block).is_ok() {
+            node.seen_blocks.insert(hash_hex.clone());
+            node.push_discovery_log(format!("fetched missing parent {hash_hex}"));
+            true
+        } else {
+            false
+        }
+    };
+    if accepted {
+        retry_orphans(node);
     }
 }
 
