@@ -218,6 +218,16 @@ impl ChainCore {
 
     pub fn accept_block(&mut self, block: Block) -> anyhow::Result<()> {
         self.validate_block_header(&block)?;
+        let block_hash = block.hash()?;
+        let parent_hash = block.header.prev_block_hash;
+        let head_hash = self.head()?.hash()?;
+        if parent_hash != head_hash {
+            self.store.put_block_by_hash_only(&block)?;
+            if block.header.height > self.store.height()? {
+                self.reorg_to(block_hash)?;
+            }
+            return Ok(());
+        }
         let (receipts, diffs) = self.execute_block_transactions(&block)?;
         let executed_gas_used: u64 = receipts.iter().map(|r| r.gas_used).sum();
         if block.header.gas_used != executed_gas_used {
@@ -292,10 +302,17 @@ impl ChainCore {
             block.header.tx_root == tx_root(&block.transactions)?,
             "tx root mismatch"
         );
-        let parent = self.head()?;
+        let parent = self
+            .store
+            .get_block_by_hash(&block.header.prev_block_hash)?
+            .ok_or_else(|| anyhow::anyhow!("missing parent block"))?;
+        self.validate_block_against_parent(block, &parent)
+    }
+
+    fn validate_block_against_parent(&self, block: &Block, parent: &Block) -> anyhow::Result<()> {
         anyhow::ensure!(
             block.header.prev_block_hash == parent.hash()?,
-            "non-head parent reorg handling is parked for MVP"
+            "parent hash mismatch"
         );
         anyhow::ensure!(
             block.header.height == parent.header.height + 1,
@@ -313,7 +330,7 @@ impl ChainCore {
             hash_leq_target(&block.header.hash()?, &nbits_to_target(block.header.nbits)),
             "insufficient proof of work"
         );
-        anyhow::ensure!(block.header.nbits == self.next_nbits(&parent)?, "bad nbits");
+        anyhow::ensure!(block.header.nbits == self.next_nbits(parent)?, "bad nbits");
         anyhow::ensure!(
             block.header.gas_price
                 == next_gas_price(
@@ -323,6 +340,102 @@ impl ChainCore {
                 ),
             "bad gas price"
         );
+        Ok(())
+    }
+
+    fn reorg_to(&mut self, new_tip_hash: Hash) -> anyhow::Result<()> {
+        let old_height = self.store.height()?;
+        let mut new_branch = Vec::new();
+        let mut cursor = self
+            .store
+            .get_block_by_hash(&new_tip_hash)?
+            .ok_or_else(|| anyhow::anyhow!("missing reorg tip"))?;
+
+        let ancestor = loop {
+            if let Some(main) = self.store.get_block_by_height(cursor.header.height)? {
+                if main.hash()? == cursor.hash()? {
+                    break main;
+                }
+            }
+            if cursor.header.height == 0 {
+                anyhow::bail!("reorg branch does not connect to genesis");
+            }
+            new_branch.push(cursor.clone());
+            cursor = self
+                .store
+                .get_block_by_hash(&cursor.header.prev_block_hash)?
+                .ok_or_else(|| anyhow::anyhow!("missing reorg parent"))?;
+        };
+
+        if new_branch.is_empty() || new_branch[0].header.height <= old_height {
+            return Ok(());
+        }
+
+        let mut old_branch = Vec::new();
+        for height in (ancestor.header.height + 1)..=old_height {
+            if let Some(block) = self.store.get_block_by_height(height)? {
+                old_branch.push(block);
+            }
+        }
+
+        for block in old_branch.iter().rev() {
+            let hash = block.hash()?;
+            let diffs = self
+                .store
+                .get_diffs(&hash)?
+                .ok_or_else(|| anyhow::anyhow!("missing state diffs for rollback"))?;
+            self.store.rollback_diffs(&diffs)?;
+        }
+        self.store
+            .set_head(ancestor.hash()?, ancestor.header.height)?;
+
+        let mut applied = Vec::new();
+        let apply_result = (|| -> anyhow::Result<()> {
+            for block in new_branch.iter().rev() {
+                self.validate_block_header(block)?;
+                let (receipts, diffs) = self.execute_block_transactions(block)?;
+                let executed_gas_used: u64 = receipts.iter().map(|r| r.gas_used).sum();
+                anyhow::ensure!(
+                    block.header.gas_used == executed_gas_used,
+                    "gas used mismatch"
+                );
+                anyhow::ensure!(
+                    block.header.receipt_root == receipt_root(&receipts)?,
+                    "receipt root mismatch"
+                );
+                self.accept_mined_block(block.clone(), receipts, diffs)?;
+                applied.push(block.clone());
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = apply_result {
+            for block in applied.iter().rev() {
+                if let Some(diffs) = self.store.get_diffs(&block.hash()?)? {
+                    self.store.rollback_diffs(&diffs)?;
+                }
+            }
+            self.store
+                .set_head(ancestor.hash()?, ancestor.header.height)?;
+            for block in &old_branch {
+                let (receipts, diffs) = self.execute_block_transactions(block)?;
+                self.accept_mined_block(block.clone(), receipts, diffs)?;
+            }
+            return Err(err);
+        }
+
+        let new_tx_hashes = new_branch
+            .iter()
+            .flat_map(|block| block.transactions.iter().filter_map(|tx| tx.hash().ok()))
+            .collect::<std::collections::HashSet<_>>();
+        for tx in old_branch
+            .iter()
+            .flat_map(|block| block.transactions.iter().cloned())
+        {
+            if tx.hash().is_ok_and(|hash| !new_tx_hashes.contains(&hash)) {
+                let _ = self.submit_tx(tx, 0);
+            }
+        }
         Ok(())
     }
 

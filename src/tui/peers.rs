@@ -75,14 +75,24 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    let (listen_addr, peers, discovered, statuses, logs) = {
+    let (listen_addr, genesis, peers, discovered, statuses, logs) = {
         let node = app.node.lock().unwrap();
         let mut peers = node.peers.iter().cloned().collect::<Vec<_>>();
         peers.sort();
         let mut discovered = node.discovered_peers.iter().cloned().collect::<Vec<_>>();
         discovered.sort();
+        let genesis = node
+            .core
+            .store
+            .get_block_by_height(0)
+            .ok()
+            .flatten()
+            .and_then(|block| block.hash().ok())
+            .map(|hash| crate::crypto::hex_hash(&hash))
+            .unwrap_or_else(|| "unknown".to_string());
         (
             node.core.cfg.listen_addr.clone(),
+            genesis,
             peers,
             discovered,
             node.peer_status.clone(),
@@ -90,8 +100,9 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         )
     };
 
-    let mut text =
-        format!("Listen: {listen_addr}\nLAN discovery: UDP broadcast on port 12368\n\nPeers:\n");
+    let mut text = format!(
+        "Listen: {listen_addr}\nGenesis: {genesis}\nLAN discovery: UDP broadcast + ARP/subnet scan on HTTP port 12367\n\nPeers:\n"
+    );
     if peers.is_empty() {
         text.push_str("  none yet\n");
     } else {
@@ -106,9 +117,11 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                 .map(|status| {
                     if status.ok {
                         format!(
-                            "online height={} seen={}s ago",
+                            "online height={} seen={}s ago head={} genesis={}",
                             status.height.unwrap_or(0),
-                            status.last_seen.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                            status.last_seen.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                            short_hash(status.head.as_deref()),
+                            short_hash(status.genesis.as_deref())
                         )
                     } else {
                         format!(
@@ -170,4 +183,9 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             .style(Style::default().fg(Color::Green)),
         chunks[3],
     );
+}
+
+fn short_hash(hash: Option<&str>) -> String {
+    hash.map(|hash| hash.chars().take(12).collect())
+        .unwrap_or_else(|| "unknown".to_string())
 }

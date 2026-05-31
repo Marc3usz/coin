@@ -171,6 +171,20 @@ impl ChainStore {
         Ok(())
     }
 
+    pub fn put_block_by_hash_only(&self, block: &Block) -> anyhow::Result<()> {
+        let hash = block.hash()?;
+        let bytes = bincode::serialize(block)?;
+        let hash_path = self
+            .data_dir
+            .join("blocks")
+            .join(format!("{}.block", hex_hash(&hash)));
+        if !hash_path.exists() {
+            std::fs::write(&hash_path, file_bytes(b"CBLK", &bytes))?;
+        }
+        self.db_put(&block_hash_key(&hash), &bytes)?;
+        Ok(())
+    }
+
     pub fn get_block_by_hash(&self, hash: &Hash) -> anyhow::Result<Option<Block>> {
         self.db_get(&block_hash_key(hash))?
             .map(|v| bincode::deserialize(&v).map_err(Into::into))
@@ -204,6 +218,12 @@ impl ChainStore {
     pub fn put_diffs(&self, block_hash: &Hash, diffs: &[StateDiff]) -> anyhow::Result<()> {
         self.db_put(&diff_key(block_hash), &bincode::serialize(diffs)?)?;
         Ok(())
+    }
+
+    pub fn get_diffs(&self, block_hash: &Hash) -> anyhow::Result<Option<Vec<StateDiff>>> {
+        self.db_get(&diff_key(block_hash))?
+            .map(|v| bincode::deserialize(&v).map_err(Into::into))
+            .transpose()
     }
 
     pub fn rollback_diffs(&self, diffs: &[StateDiff]) -> anyhow::Result<()> {

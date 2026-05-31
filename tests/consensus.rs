@@ -468,6 +468,7 @@ fn scale_target_tightens_and_relaxes_predictably() {
     let initial = nbits_to_target(0x20ffffff);
     assert_eq!(target_to_nbits(&scale_target(initial, 1, 4)), 0x203fffff);
     assert_eq!(target_to_nbits(&scale_target(initial, 4, 1)), 0x20ffffff);
+    assert_eq!(target_to_nbits(&scale_target(initial, 1, 16)), 0x200fffff);
 }
 
 #[test]
@@ -482,7 +483,7 @@ fn retarget_tightens_when_blocks_are_too_fast() {
 
     let head = core.head().unwrap();
     assert_eq!(head.header.height, 128);
-    assert_eq!(head.header.nbits, 0x203fffff);
+    assert_eq!(head.header.nbits, 0x2007ffff);
     assert!(
         nbits_to_target(head.header.nbits) < nbits_to_target(initial),
         "fast retarget should lower target: initial=0x{initial:08x}, actual=0x{:08x}",

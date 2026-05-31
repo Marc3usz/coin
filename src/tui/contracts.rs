@@ -1,9 +1,10 @@
 use crate::crypto::{decode_hash, hex_hash};
 use crate::node::gossip_tx;
 use crate::tui::app::{push_log, App};
+use crate::tui::tx_options::{parse_u64, sign_with_optional_grind};
 use crate::types::Transaction;
 use crate::vm::{encode_contract_call, ContractCallKind, ContractCallPayload, Value};
-use crate::wallet::{sign_tx, WalletFile};
+use crate::wallet::WalletFile;
 use crossterm::event::{KeyCode, KeyEvent};
 use ethnum::U256;
 use ratatui::{
@@ -41,7 +42,10 @@ fn input(input: &mut tui_input::Input, key: KeyEvent) {
 fn input_focused(app: &mut App, key: KeyEvent) {
     let arg_count = visible_arg_count(app);
     let value_idx = 2 + arg_count;
-    let fee_idx = value_idx + 1;
+    let gas_idx = value_idx + 1;
+    let max_gas_idx = value_idx + 2;
+    let fee_idx = value_idx + 3;
+    let grind_idx = value_idx + 4;
     match app.contracts_state.focus {
         0 => input(&mut app.contracts_state.address_input, key),
         1 => input(&mut app.contracts_state.method_input, key),
@@ -53,7 +57,10 @@ fn input_focused(app: &mut App, key: KeyEvent) {
             }
         }
         idx if idx == value_idx => input(&mut app.contracts_state.value_input, key),
+        idx if idx == gas_idx => input(&mut app.contracts_state.gas_limit_input, key),
+        idx if idx == max_gas_idx => input(&mut app.contracts_state.max_gas_price_input, key),
         idx if idx == fee_idx => input(&mut app.contracts_state.fee_input, key),
+        idx if idx == grind_idx => input(&mut app.contracts_state.grind_input, key),
         _ => {}
     }
 }
@@ -63,7 +70,7 @@ fn visible_arg_count(app: &App) -> usize {
 }
 
 fn contract_field_count(app: &App) -> usize {
-    visible_arg_count(app) + 5
+    visible_arg_count(app) + 8
 }
 
 fn submit_index(app: &App) -> usize {
@@ -146,6 +153,30 @@ fn submit_contract_call(app: &mut App) {
             return;
         }
     };
+    let gas_limit = match parse_u64(app.contracts_state.gas_limit_input.value(), "gas limit") {
+        Ok(v) if v > 0 => v,
+        _ => {
+            app.contracts_state.result_msg = "invalid gas limit".to_string();
+            return;
+        }
+    };
+    let max_gas_price = match parse_u128(
+        app.contracts_state.max_gas_price_input.value().trim(),
+        "max gas price",
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            app.contracts_state.result_msg = err;
+            return;
+        }
+    };
+    let grind = match parse_u64(app.contracts_state.grind_input.value(), "grind iterations") {
+        Ok(v) => v.min(100_000),
+        Err(err) => {
+            app.contracts_state.result_msg = err;
+            return;
+        }
+    };
     let payload = match encode_contract_call(&ContractCallPayload {
         kind: ContractCallKind::Method,
         method_idx,
@@ -200,8 +231,8 @@ fn submit_contract_call(app: &mut App) {
         from: from_addr,
         to,
         value,
-        gas_limit: 10_000_000,
-        max_gas_price: 1000,
+        gas_limit,
+        max_gas_price,
         mining_tip: fee,
         expiration_height: None,
         payload,
@@ -210,7 +241,7 @@ fn submit_contract_call(app: &mut App) {
         public_key: vec![],
         signature: vec![],
     };
-    let tx = match sign_tx(tx, node.core.cfg.chain_id, &wallet) {
+    let tx = match sign_with_optional_grind(tx, node.core.cfg.chain_id, &wallet, grind) {
         Ok(t) => t,
         Err(e) => {
             app.contracts_state.result_msg = format!("sign error: {e}");
@@ -380,6 +411,9 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
         Constraint::Length(5),
         Constraint::Min(7),
     ]);
@@ -455,7 +489,10 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         );
     }
     let value_idx = 2 + arg_count;
-    let fee_idx = value_idx + 1;
+    let gas_idx = value_idx + 1;
+    let max_gas_idx = value_idx + 2;
+    let fee_idx = value_idx + 3;
+    let grind_idx = value_idx + 4;
     let button_idx = submit_index(app);
     render_input(
         f,
@@ -469,12 +506,56 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     );
     render_input(
         f,
+        chunks[gas_idx],
+        " Gas Limit ",
+        app.contracts_state.gas_limit_input.value(),
+        field_style(
+            style(gas_idx),
+            app.contracts_state
+                .gas_limit_input
+                .value()
+                .trim()
+                .parse::<u64>()
+                .is_ok_and(|v| v > 0),
+        ),
+    );
+    render_input(
+        f,
+        chunks[max_gas_idx],
+        " Max Gas Price ",
+        app.contracts_state.max_gas_price_input.value(),
+        field_style(
+            style(max_gas_idx),
+            parse_u128(
+                app.contracts_state.max_gas_price_input.value().trim(),
+                "max gas price",
+            )
+            .is_ok(),
+        ),
+    );
+    render_input(
+        f,
         chunks[fee_idx],
         " Mining Tip ",
         app.contracts_state.fee_input.value(),
         field_style(
             style(fee_idx),
             parse_u128(app.contracts_state.fee_input.value().trim(), "fee").is_ok(),
+        ),
+    );
+    render_input(
+        f,
+        chunks[grind_idx],
+        " Grind Nonces (0-100000) ",
+        app.contracts_state.grind_input.value(),
+        field_style(
+            style(grind_idx),
+            app.contracts_state
+                .grind_input
+                .value()
+                .trim()
+                .parse::<u64>()
+                .is_ok(),
         ),
     );
     let btn_style = if app.contracts_state.focus == button_idx {

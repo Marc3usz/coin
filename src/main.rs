@@ -3,7 +3,8 @@ use coin::chain::ChainCore;
 use coin::config::NodeConfig;
 use coin::crypto::{decode_hash, hex_hash, Address};
 use coin::node::{
-    gossip_block_header, normalize_peer_url, run_lan_discovery, run_peer_sync, serve, NodeServer,
+    advertised_peer_url, gossip_block, normalize_peer_url, run_lan_discovery, run_peer_sync, serve,
+    NodeServer,
 };
 use coin::types::Transaction;
 use coin::wallet::{sign_tx, WalletFile};
@@ -122,10 +123,7 @@ pub fn start_node_background(mut cfg: NodeConfig) -> anyhow::Result<Arc<Mutex<No
                         .push_log(format!("mining candidate block {next_height}"));
                     let miner = miner.unwrap_or([0; 32]);
                     let peers = node.peers.iter().cloned().collect::<Vec<_>>();
-                    let listen = format!(
-                        "http://{}",
-                        node.core.cfg.listen_addr.replace("0.0.0.0", "127.0.0.1")
-                    );
+                    let listen = advertised_peer_url(&node.core.cfg.listen_addr);
                     match node.core.mine_next_block(miner) {
                         Ok(block) => {
                             let height = block.header.height;
@@ -146,7 +144,7 @@ pub fn start_node_background(mut cfg: NodeConfig) -> anyhow::Result<Arc<Mutex<No
                     }
                 };
                 if let Some((peers, listen, block)) = mined {
-                    gossip_block_header(peers, listen, &block).await;
+                    gossip_block(peers, listen, block).await;
                     tokio::time::sleep(Duration::from_secs(4)).await;
                     continue;
                 }

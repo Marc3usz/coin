@@ -1282,6 +1282,54 @@ mod calls {
     }
 
     #[test]
+    fn test_invoke_delegate_preserves_original_caller_and_value() {
+        let mut db = MockStateDB::new();
+        let library = [0x93; 32];
+        let mut library_metadata = Metadata::default();
+        library_metadata
+            .methods
+            .insert(1, MethodMeta { args: 0, rets: 0 });
+        db.contracts.insert(
+            library,
+            ContractBlob {
+                metadata: library_metadata,
+                code: vec![
+                    Opcode::Caller as u8,
+                    Opcode::SetState as u8,
+                    8,
+                    Opcode::CallValue as u8,
+                    Opcode::SetState as u8,
+                    9,
+                    Opcode::Stop as u8,
+                ],
+            },
+        );
+        let mut ctx = setup_ctx(vec![Opcode::InvokeDelegate as u8, 0, 1]);
+        ctx.caller = [0x44; 32];
+        ctx.value = U256::from(77u64);
+        ctx.metadata
+            .methods
+            .insert(1, MethodMeta { args: 0, rets: 0 });
+        let context_address = ctx.address;
+        let env = setup_env();
+        let mut vm = LiteVM::new(ctx, env, &mut db, 100000);
+        vm.stack.push(Value::U64(10_000));
+        vm.stack.push(Value::Address(library));
+        let res = vm.run();
+        assert_eq!(res, ExitReason::Halt);
+        drop(vm);
+        assert_eq!(
+            db.state.get(&(context_address, 8)),
+            Some(&Value::Address([0x44; 32]))
+        );
+        assert_eq!(
+            db.state.get(&(context_address, 9)),
+            Some(&Value::U256(U256::from(77u64)))
+        );
+        assert_eq!(db.state.get(&(library, 8)), None);
+    }
+
+    #[test]
     fn test_invoke_interface_requires_caller_interface_metadata() {
         let mut db = MockStateDB::new();
         let ctx = setup_ctx(vec![Opcode::InvokeInterface as u8, 0, 1]);

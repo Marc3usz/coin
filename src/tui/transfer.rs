@@ -1,8 +1,9 @@
 use crate::crypto::decode_hash;
 use crate::node::gossip_tx;
 use crate::tui::app::App;
+use crate::tui::tx_options::{parse_u128, parse_u64, sign_with_optional_grind};
 use crate::types::Transaction;
-use crate::wallet::{sign_tx, WalletFile};
+use crate::wallet::WalletFile;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -15,16 +16,16 @@ use tui_input::backend::crossterm::EventHandler;
 pub fn handle_event(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Down => {
-            app.transfer_state.focus = (app.transfer_state.focus + 1) % 4;
+            app.transfer_state.focus = (app.transfer_state.focus + 1) % 7;
         }
         KeyCode::Up => {
-            app.transfer_state.focus = (app.transfer_state.focus + 3) % 4;
+            app.transfer_state.focus = (app.transfer_state.focus + 6) % 7;
         }
         KeyCode::Enter => {
-            if app.transfer_state.focus == 3 {
+            if app.transfer_state.focus == 6 {
                 submit_transfer(app);
             } else {
-                app.transfer_state.focus = (app.transfer_state.focus + 1) % 4;
+                app.transfer_state.focus = (app.transfer_state.focus + 1) % 7;
             }
         }
         _ => match app.transfer_state.focus {
@@ -40,7 +41,22 @@ pub fn handle_event(app: &mut App, key: KeyEvent) {
             }
             2 => {
                 app.transfer_state
+                    .gas_limit_input
+                    .handle_event(&crossterm::event::Event::Key(key));
+            }
+            3 => {
+                app.transfer_state
+                    .max_gas_price_input
+                    .handle_event(&crossterm::event::Event::Key(key));
+            }
+            4 => {
+                app.transfer_state
                     .fee_input
+                    .handle_event(&crossterm::event::Event::Key(key));
+            }
+            5 => {
+                app.transfer_state
+                    .grind_input
                     .handle_event(&crossterm::event::Event::Key(key));
             }
             _ => {}
@@ -51,7 +67,6 @@ pub fn handle_event(app: &mut App, key: KeyEvent) {
 fn submit_transfer(app: &mut App) {
     let to_str = app.transfer_state.to_input.value().trim();
     let amount_str = app.transfer_state.amount_input.value().trim();
-    let fee_str = app.transfer_state.fee_input.value().trim();
 
     // Check address book first
     let to_addr_str = app
@@ -73,18 +88,41 @@ fn submit_transfer(app: &mut App) {
         }
     };
 
-    let amount: u128 = match amount_str.parse() {
+    let amount = match parse_u128(amount_str, "amount") {
         Ok(v) => v,
-        Err(_) => {
-            app.transfer_state.result_msg = "Invalid amount".to_string();
+        Err(e) => {
+            app.transfer_state.result_msg = e;
             return;
         }
     };
-
-    let fee: u128 = match fee_str.parse() {
+    let gas_limit = match parse_u64(app.transfer_state.gas_limit_input.value(), "gas limit") {
+        Ok(v) if v > 0 => v,
+        _ => {
+            app.transfer_state.result_msg = "invalid gas limit".to_string();
+            return;
+        }
+    };
+    let max_gas_price = match parse_u128(
+        app.transfer_state.max_gas_price_input.value(),
+        "max gas price",
+    ) {
         Ok(v) => v,
-        Err(_) => {
-            app.transfer_state.result_msg = "Invalid fee".to_string();
+        Err(e) => {
+            app.transfer_state.result_msg = e;
+            return;
+        }
+    };
+    let fee = match parse_u128(app.transfer_state.fee_input.value(), "mining tip") {
+        Ok(v) => v,
+        Err(e) => {
+            app.transfer_state.result_msg = e;
+            return;
+        }
+    };
+    let grind = match parse_u64(app.transfer_state.grind_input.value(), "grind iterations") {
+        Ok(v) => v.min(100_000),
+        Err(e) => {
+            app.transfer_state.result_msg = e;
             return;
         }
     };
@@ -114,8 +152,8 @@ fn submit_transfer(app: &mut App) {
         from: from_addr,
         to,
         value: amount,
-        gas_limit: 100_000,
-        max_gas_price: 1000,
+        gas_limit,
+        max_gas_price,
         mining_tip: fee,
         expiration_height: None,
         payload: vec![],
@@ -125,7 +163,7 @@ fn submit_transfer(app: &mut App) {
         signature: vec![],
     };
 
-    let tx = match sign_tx(tx, node.core.cfg.chain_id, &wallet) {
+    let tx = match sign_with_optional_grind(tx, node.core.cfg.chain_id, &wallet, grind) {
         Ok(t) => t,
         Err(e) => {
             app.transfer_state.result_msg = format!("Sign error: {}", e);
@@ -143,7 +181,7 @@ fn submit_transfer(app: &mut App) {
         );
         app.transfer_state.to_input.reset();
         app.transfer_state.amount_input.reset();
-        app.transfer_state.focus = 3;
+        app.transfer_state.focus = 6;
     } else {
         app.transfer_state.result_msg = format!(
             "Failed: {}",
@@ -156,6 +194,9 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -203,8 +244,25 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         ));
     f.render_widget(amount_widget, chunks[1]);
 
+    render_num(
+        f,
+        chunks[2],
+        " Gas Limit ",
+        app.transfer_state.gas_limit_input.value(),
+        app.transfer_state.focus == 2,
+        false,
+    );
+    render_num(
+        f,
+        chunks[3],
+        " Max Gas Price ",
+        app.transfer_state.max_gas_price_input.value(),
+        app.transfer_state.focus == 3,
+        false,
+    );
+
     // Fee
-    let fee_style = if app.transfer_state.focus == 2 {
+    let fee_style = if app.transfer_state.focus == 4 {
         focused_style
     } else {
         normal_style
@@ -224,10 +282,19 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                 .parse::<u128>()
                 .is_ok(),
         ));
-    f.render_widget(fee_widget, chunks[2]);
+    f.render_widget(fee_widget, chunks[4]);
+
+    render_num(
+        f,
+        chunks[5],
+        " Grind Nonces (0-100000) ",
+        app.transfer_state.grind_input.value(),
+        app.transfer_state.focus == 5,
+        true,
+    );
 
     // Submit Button
-    let btn_style = if app.transfer_state.focus == 3 {
+    let btn_style = if app.transfer_state.focus == 6 {
         Style::default()
             .bg(Color::Cyan)
             .fg(Color::Black)
@@ -238,13 +305,40 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let btn_widget = Paragraph::new(" [ SUBMIT TRANSFER ] ")
         .block(Block::default().borders(Borders::ALL))
         .style(btn_style);
-    f.render_widget(btn_widget, chunks[3]);
+    f.render_widget(btn_widget, chunks[6]);
 
     // Result Message
     let res_widget = Paragraph::new(app.transfer_state.result_msg.clone())
         .block(Block::default().borders(Borders::ALL).title(" Result "))
         .style(Style::default().fg(Color::Green));
-    f.render_widget(res_widget, chunks[4]);
+    f.render_widget(res_widget, chunks[7]);
+}
+
+fn render_num(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    value: &str,
+    focused: bool,
+    allow_zero: bool,
+) {
+    let style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let valid = value
+        .trim()
+        .parse::<u128>()
+        .is_ok_and(|v| allow_zero || v > 0);
+    f.render_widget(
+        Paragraph::new(value.to_string())
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .style(field_style(style, valid)),
+        area,
+    );
 }
 
 fn field_style(style: Style, valid: bool) -> Style {

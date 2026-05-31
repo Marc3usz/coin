@@ -8,7 +8,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::cors::CorsLayer;
@@ -32,6 +33,8 @@ pub struct NodeServer {
 pub struct PeerStatus {
     pub ok: bool,
     pub height: Option<u64>,
+    pub head: Option<String>,
+    pub genesis: Option<String>,
     pub last_seen: Option<Instant>,
     pub last_error: Option<String>,
 }
@@ -74,6 +77,7 @@ pub struct HealthResponse {
     pub chain_id: u64,
     pub height: u64,
     pub head: String,
+    pub genesis: String,
     pub peers: usize,
 }
 
@@ -242,6 +246,18 @@ pub fn normalize_peer_url(peer: &str) -> String {
     }
 }
 
+pub fn advertised_peer_url(listen_addr: &str) -> String {
+    let advertised = if listen_addr.starts_with("0.0.0.0:") {
+        match local_ipv4() {
+            Some(ip) => listen_addr.replacen("0.0.0.0", &ip.to_string(), 1),
+            None => listen_addr.replacen("0.0.0.0", "127.0.0.1", 1),
+        }
+    } else {
+        listen_addr.to_string()
+    };
+    normalize_peer_url(&advertised)
+}
+
 pub async fn run_peer_sync(node: SharedNode) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -256,19 +272,87 @@ pub async fn run_peer_sync(node: SharedNode) {
         }
     };
     let mut tick = tokio::time::interval(Duration::from_secs(4));
+    let mut scan_tick = tokio::time::interval(Duration::from_secs(20));
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = scan_tick.tick() => scan_lan_for_peers(&node, &client).await,
+        }
         let (peers, self_url) = {
             let node = node.lock().unwrap();
-            let self_url = format!(
-                "http://{}",
-                node.core.cfg.listen_addr.replace("0.0.0.0", "127.0.0.1")
-            );
+            let self_url = advertised_peer_url(&node.core.cfg.listen_addr);
             (node.peers.iter().cloned().collect::<Vec<_>>(), self_url)
         };
         for peer in peers {
             sync_peer(&node, &client, peer, self_url.clone()).await;
         }
+    }
+}
+
+async fn scan_lan_for_peers(node: &SharedNode, client: &reqwest::Client) {
+    let (chain_id, self_port, self_genesis, known) = {
+        let node = node.lock().unwrap();
+        let self_genesis = genesis_hash(&node).unwrap_or_default();
+        (
+            node.core.cfg.chain_id,
+            listen_port(&node.core.cfg.listen_addr).unwrap_or(12367),
+            self_genesis,
+            node.peers.clone(),
+        )
+    };
+    let mut candidates = arp_ipv4_candidates();
+    let local_ip = local_ipv4();
+    if let Some(local) = local_ip {
+        let [a, b, c, _] = local.octets();
+        candidates.extend((1..=254).map(|d| Ipv4Addr::new(a, b, c, d)));
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let mut spawned = 0usize;
+    for ip in candidates {
+        if ip.is_loopback() || ip.is_unspecified() || local_ip == Some(ip) {
+            continue;
+        }
+        let peer = normalize_peer_url(&format!("{ip}:{self_port}"));
+        if known.contains(&peer) {
+            continue;
+        }
+        spawned += 1;
+        let node = node.clone();
+        let client = client.clone();
+        let self_genesis = self_genesis.clone();
+        tokio::spawn(async move {
+            let base = peer.trim_end_matches('/');
+            let Ok(res) = client.get(format!("{base}/health")).send().await else {
+                return;
+            };
+            let Ok(health) = res.json::<HealthResponse>().await else {
+                return;
+            };
+            if !health.ok || health.chain_id != chain_id {
+                return;
+            }
+            if health.genesis != self_genesis {
+                mark_peer_error(
+                    &node,
+                    &peer,
+                    "genesis mismatch; reset one node's data dir".to_string(),
+                );
+                return;
+            }
+            let mut node = node.lock().unwrap();
+            let is_new = node.peers.insert(peer.clone());
+            node.discovered_peers.insert(peer.clone());
+            if is_new {
+                node.push_discovery_log(format!("LAN scan found {peer}"));
+            }
+        });
+    }
+    if spawned > 0 {
+        node.lock()
+            .unwrap()
+            .push_discovery_log(format!("LAN scan probing {spawned} candidates"));
     }
 }
 
@@ -295,7 +379,26 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
         mark_peer_error(node, &peer, format!("wrong chain id {}", health.chain_id));
         return;
     }
-    mark_peer_ok(node, &peer, health.height);
+    let local_genesis = node
+        .lock()
+        .unwrap()
+        .core
+        .store
+        .get_block_by_height(0)
+        .ok()
+        .flatten()
+        .and_then(|block| block.hash().ok())
+        .map(|hash| hex_hash(&hash))
+        .unwrap_or_default();
+    if health.genesis != local_genesis {
+        mark_peer_error(
+            node,
+            &peer,
+            "genesis mismatch; reset one node's data dir".to_string(),
+        );
+        return;
+    }
+    mark_peer_ok(node, &peer, &health);
 
     let local_height = node.lock().unwrap().core.store.height().unwrap_or(0);
     if health.height > local_height {
@@ -336,6 +439,8 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
         }
     }
 
+    sync_mempool(node, client, &peer, base).await;
+
     if let Ok(res) = client.get(format!("{base}/peers")).send().await {
         if let Ok(remote_peers) = res.json::<Vec<String>>().await {
             let mut node = node.lock().unwrap();
@@ -359,13 +464,66 @@ async fn sync_peer(node: &SharedNode, client: &reqwest::Client, peer: String, se
         .await;
 }
 
-fn mark_peer_ok(node: &SharedNode, peer: &str, height: u64) {
+async fn sync_mempool(node: &SharedNode, client: &reqwest::Client, peer: &str, base: &str) {
+    let Ok(res) = client.get(format!("{base}/mempool")).send().await else {
+        return;
+    };
+    if !res.status().is_success() {
+        return;
+    }
+    let Ok(remote_txs) = res.json::<Vec<Transaction>>().await else {
+        return;
+    };
+    if remote_txs.is_empty() {
+        return;
+    }
+
+    let mut accepted = Vec::new();
+    {
+        let mut node = node.lock().unwrap();
+        let peer_count = node.peers.len();
+        for tx in remote_txs {
+            let tx_hash = tx.hash().ok().map(|hash| hex_hash(&hash));
+            if tx_hash
+                .as_ref()
+                .is_some_and(|hash| node.seen_txs.contains(hash))
+            {
+                continue;
+            }
+            let result = node.core.submit_tx(tx.clone(), peer_count);
+            if result.accepted {
+                if let Some(hash) = tx_hash {
+                    node.seen_txs.insert(hash);
+                }
+                accepted.push(tx);
+            }
+        }
+        if !accepted.is_empty() {
+            node.push_discovery_log(format!("synced {} mempool txs from {peer}", accepted.len()));
+        }
+    }
+
+    for tx in accepted {
+        let peers = node
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        tokio::spawn(gossip_tx(peers, tx));
+    }
+}
+
+fn mark_peer_ok(node: &SharedNode, peer: &str, health: &HealthResponse) {
     let mut node = node.lock().unwrap();
     node.peer_status.insert(
         peer.to_string(),
         PeerStatus {
             ok: true,
-            height: Some(height),
+            height: Some(health.height),
+            head: Some(health.head.clone()),
+            genesis: Some(health.genesis.clone()),
             last_seen: Some(Instant::now()),
             last_error: None,
         },
@@ -379,11 +537,45 @@ fn mark_peer_error(node: &SharedNode, peer: &str, err: String) {
         PeerStatus {
             ok: false,
             height: None,
+            head: None,
+            genesis: None,
             last_seen: None,
             last_error: Some(err.clone()),
         },
     );
     node.push_discovery_log(format!("peer {peer}: {err}"));
+}
+
+fn genesis_hash(node: &NodeServer) -> anyhow::Result<String> {
+    let block = node
+        .core
+        .store
+        .get_block_by_height(0)?
+        .ok_or_else(|| anyhow::anyhow!("missing genesis block"))?;
+    Ok(hex_hash(&block.hash()?))
+}
+
+fn local_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+fn arp_ipv4_candidates() -> Vec<Ipv4Addr> {
+    let Ok(output) = Command::new("arp").arg("-a").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|part| part.parse::<Ipv4Addr>().ok())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        .collect()
 }
 
 pub async fn serve(node: SharedNode) -> anyhow::Result<()> {
@@ -415,11 +607,13 @@ pub fn router(node: SharedNode) -> Router {
 async fn health(State(node): State<SharedNode>) -> Json<HealthResponse> {
     let node = node.lock().unwrap();
     let head = node.core.head().and_then(|b| b.hash()).unwrap_or([0; 32]);
+    let genesis = genesis_hash(&node).unwrap_or_else(|_| "unknown".to_string());
     Json(HealthResponse {
         ok: true,
         chain_id: node.core.cfg.chain_id,
         height: node.core.store.height().unwrap_or(0),
         head: hex_hash(&head),
+        genesis,
         peers: node.peers.len(),
     })
 }
@@ -497,18 +691,32 @@ async fn submit_block_json(
     Json(block): Json<Block>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let hash = block.hash().unwrap_or([0; 32]);
+    let hash_hex = hex_hash(&hash);
     let block_for_gossip = block.clone();
     let accepted = {
         let mut node = node.lock().unwrap();
+        if node.seen_blocks.contains(&hash_hex)
+            || node
+                .core
+                .store
+                .get_block_by_hash(&hash)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({ "accepted": true, "hash": hash_hex, "warning": "already seen" }),
+                ),
+            );
+        }
         match node.core.accept_block(block) {
             Ok(()) => {
-                node.seen_blocks.insert(hex_hash(&hash));
+                node.seen_blocks.insert(hash_hex.clone());
                 Some((
                     node.peers.iter().cloned().collect::<Vec<_>>(),
-                    format!(
-                        "http://{}",
-                        node.core.cfg.listen_addr.replace("0.0.0.0", "127.0.0.1")
-                    ),
+                    advertised_peer_url(&node.core.cfg.listen_addr),
                 ))
             }
             Err(err) => {
@@ -520,11 +728,11 @@ async fn submit_block_json(
         }
     };
     if let Some((peers, from)) = accepted {
-        tokio::spawn(async move { gossip_block_header(peers, from, &block_for_gossip).await });
+        tokio::spawn(async move { gossip_block(peers, from, block_for_gossip).await });
     }
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "accepted": true, "hash": hex_hash(&hash) })),
+        Json(serde_json::json!({ "accepted": true, "hash": hash_hex })),
     )
 }
 
@@ -545,13 +753,77 @@ async fn block_header_announce(
     State(node): State<SharedNode>,
     Json(msg): Json<HeaderAnnouncement>,
 ) -> Json<serde_json::Value> {
-    let mut node = node.lock().unwrap();
-    if node.is_peer_allowed(&msg.from) {
-        node.peers.insert(msg.from);
+    let (seen, height, should_fetch, from, hash) = {
+        let mut node = node.lock().unwrap();
+        if node.is_peer_allowed(&msg.from) {
+            node.peers.insert(normalize_peer_url(&msg.from));
+        }
+        let seen = node.seen_blocks.contains(&msg.block_hash)
+            || decode_hash(&msg.block_hash)
+                .ok()
+                .and_then(|hash| node.core.store.get_block_by_hash(&hash).ok().flatten())
+                .is_some();
+        (
+            seen,
+            node.core.store.height().unwrap_or(0),
+            !seen && msg.height > node.core.store.height().unwrap_or(0),
+            normalize_peer_url(&msg.from),
+            msg.block_hash,
+        )
+    };
+    if should_fetch {
+        let node = node.clone();
+        tokio::spawn(async move { fetch_announced_block(node, from, hash).await });
     }
-    Json(
-        serde_json::json!({ "seen": node.seen_blocks.contains(&msg.block_hash), "height": node.core.store.height().unwrap_or(0) }),
-    )
+    Json(serde_json::json!({ "seen": seen, "height": height }))
+}
+
+async fn fetch_announced_block(node: SharedNode, from: String, hash: String) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let base = from.trim_end_matches('/');
+    let Ok(res) = client.get(format!("{base}/block/hash/{hash}")).send().await else {
+        return;
+    };
+    if !res.status().is_success() {
+        return;
+    }
+    let Ok(block) = res.json::<Block>().await else {
+        return;
+    };
+    let hash = block
+        .hash()
+        .ok()
+        .map(|hash| hex_hash(&hash))
+        .unwrap_or_default();
+    let block_for_gossip = block.clone();
+    let accepted = {
+        let mut node = node.lock().unwrap();
+        match node.core.accept_block(block) {
+            Ok(()) => {
+                node.seen_blocks.insert(hash.clone());
+                node.push_discovery_log(format!("accepted announced block {hash} from {from}"));
+                Some((
+                    node.peers.iter().cloned().collect::<Vec<_>>(),
+                    advertised_peer_url(&node.core.cfg.listen_addr),
+                ))
+            }
+            Err(err) => {
+                node.push_discovery_log(format!(
+                    "announced block {hash} from {from} failed: {err}"
+                ));
+                None
+            }
+        }
+    };
+    if let Some((peers, from)) = accepted {
+        tokio::spawn(async move { gossip_block(peers, from, block_for_gossip).await });
+    }
 }
 
 async fn block_by_hash(
@@ -615,7 +887,13 @@ async fn mempool(State(node): State<SharedNode>) -> Json<Vec<Transaction>> {
 }
 
 pub async fn gossip_tx(peers: Vec<String>, tx: Transaction) {
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
     for peer in peers {
         let _ = client
             .post(format!("{}/tx", peer.trim_end_matches('/')))
@@ -623,6 +901,24 @@ pub async fn gossip_tx(peers: Vec<String>, tx: Transaction) {
             .send()
             .await;
     }
+}
+
+pub async fn gossip_block(peers: Vec<String>, from: String, block: Block) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    for peer in &peers {
+        let _ = client
+            .post(format!("{}/block", peer.trim_end_matches('/')))
+            .json(&block)
+            .send()
+            .await;
+    }
+    gossip_block_header(peers, from, &block).await;
 }
 
 pub async fn gossip_block_header(peers: Vec<String>, from: String, block: &Block) {
@@ -634,7 +930,13 @@ pub async fn gossip_block_header(peers: Vec<String>, from: String, block: &Block
         block_hash: hex_hash(&hash),
         height: block.header.height,
     };
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return,
+    };
     for peer in peers {
         let _ = client
             .post(format!("{}/block/header", peer.trim_end_matches('/')))

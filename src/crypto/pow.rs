@@ -41,7 +41,7 @@ pub fn target_to_nbits(target: &Hash) -> u32 {
 }
 
 pub fn scale_target(target: Hash, actual: u64, expected: u64) -> Hash {
-    let actual = actual.clamp(expected / 4, expected * 4).max(1) as u128;
+    let actual = actual.max(1) as u128;
     let expected = U256::from(expected.max(1) as u128);
     let actual = U256::from(actual);
     let target = U256::from_be_bytes(target);

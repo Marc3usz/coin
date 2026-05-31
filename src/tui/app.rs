@@ -119,8 +119,11 @@ impl Default for SearchState {
 pub struct TransferState {
     pub to_input: Input,
     pub amount_input: Input,
+    pub gas_limit_input: Input,
+    pub max_gas_price_input: Input,
     pub fee_input: Input,
-    pub focus: usize, // 0: To, 1: Amount, 2: Fee
+    pub grind_input: Input,
+    pub focus: usize,
     pub result_msg: String,
 }
 
@@ -129,8 +132,11 @@ impl Default for TransferState {
         Self {
             to_input: Input::default(),
             amount_input: Input::default(),
+            gas_limit_input: Input::default().with_value("100000".to_string()),
+            max_gas_price_input: Input::default().with_value("1000".to_string()),
             fee_input: Input::default().with_value("1".to_string()),
-            focus: 3,
+            grind_input: Input::default().with_value("0".to_string()),
+            focus: 6,
             result_msg: String::new(),
         }
     }
@@ -141,7 +147,10 @@ pub struct ContractsState {
     pub method_input: Input,
     pub args_input: Input,
     pub value_input: Input,
+    pub gas_limit_input: Input,
+    pub max_gas_price_input: Input,
     pub fee_input: Input,
+    pub grind_input: Input,
     pub arg_inputs: Vec<Input>,
     pub arg_labels: Vec<String>,
     pub arg_types: Vec<String>,
@@ -155,7 +164,9 @@ pub struct DeployState {
     pub deploy_path_input: Input,
     pub deploy_gas_input: Input,
     pub value_input: Input,
+    pub max_gas_price_input: Input,
     pub fee_input: Input,
+    pub grind_input: Input,
     pub focus: usize,
     pub result_msg: String,
     pub logs: Vec<String>,
@@ -168,7 +179,10 @@ impl Default for ContractsState {
             method_input: Input::default(),
             args_input: Input::default(),
             value_input: Input::default().with_value("0".to_string()),
+            gas_limit_input: Input::default().with_value("10000000".to_string()),
+            max_gas_price_input: Input::default().with_value("1000".to_string()),
             fee_input: Input::default().with_value("1".to_string()),
+            grind_input: Input::default().with_value("0".to_string()),
             arg_inputs: Vec::new(),
             arg_labels: Vec::new(),
             arg_types: Vec::new(),
@@ -186,8 +200,10 @@ impl Default for DeployState {
             deploy_path_input: Input::default(),
             deploy_gas_input: Input::default().with_value("10000000".to_string()),
             value_input: Input::default().with_value("0".to_string()),
+            max_gas_price_input: Input::default().with_value("1000".to_string()),
             fee_input: Input::default().with_value("1".to_string()),
-            focus: 4,
+            grind_input: Input::default().with_value("0".to_string()),
+            focus: 6,
             result_msg: String::new(),
             logs: vec!["deploy wizard ready".to_string()],
         }
@@ -444,12 +460,12 @@ impl App {
         match self.active_tab {
             Tab::Dashboard => false,
             Tab::Wallet => self.wallet_state.prompt == WalletPrompt::ConfirmOverwrite,
-            Tab::Transfer => self.transfer_state.focus < 3,
+            Tab::Transfer => self.transfer_state.focus < 6,
             Tab::Contracts => {
                 let arg_count = self.contracts_state.arg_inputs.len().max(1);
-                self.contracts_state.focus != arg_count + 4
+                self.contracts_state.focus != arg_count + 7
             }
-            Tab::Deploy => self.deploy_state.focus < 4,
+            Tab::Deploy => self.deploy_state.focus < 6,
             Tab::AddressBook => self.address_book_state.editing,
             Tab::AbiWizard => self.abi_wizard_state.focus < 6,
             Tab::Peers => self.peers_state.focus == 0,

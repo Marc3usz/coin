@@ -7,6 +7,7 @@ pub mod deploy;
 pub mod peers;
 pub mod search;
 pub mod transfer;
+pub mod tx_options;
 pub mod wallet;
 
 pub use app::App;

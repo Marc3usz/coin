@@ -2,9 +2,10 @@ use crate::chain::contract_address;
 use crate::crypto::hex_hash;
 use crate::node::gossip_tx;
 use crate::tui::app::{push_log, App};
+use crate::tui::tx_options::{parse_u64, sign_with_optional_grind};
 use crate::types::Transaction;
 use crate::vm::decode_contract_blob;
-use crate::wallet::{sign_tx, WalletFile};
+use crate::wallet::WalletFile;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -17,20 +18,22 @@ use tui_input::backend::crossterm::EventHandler;
 
 pub fn handle_event(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Down => app.deploy_state.focus = (app.deploy_state.focus + 1) % 5,
-        KeyCode::Up => app.deploy_state.focus = (app.deploy_state.focus + 4) % 5,
+        KeyCode::Down => app.deploy_state.focus = (app.deploy_state.focus + 1) % 7,
+        KeyCode::Up => app.deploy_state.focus = (app.deploy_state.focus + 6) % 7,
         KeyCode::Enter => {
-            if app.deploy_state.focus == 4 {
+            if app.deploy_state.focus == 6 {
                 submit_contract_deploy(app);
             } else {
-                app.deploy_state.focus = (app.deploy_state.focus + 1) % 5;
+                app.deploy_state.focus = (app.deploy_state.focus + 1) % 7;
             }
         }
         _ => match app.deploy_state.focus {
             0 => input(&mut app.deploy_state.deploy_path_input, key),
             1 => input(&mut app.deploy_state.value_input, key),
             2 => input(&mut app.deploy_state.deploy_gas_input, key),
-            3 => input(&mut app.deploy_state.fee_input, key),
+            3 => input(&mut app.deploy_state.max_gas_price_input, key),
+            4 => input(&mut app.deploy_state.fee_input, key),
+            5 => input(&mut app.deploy_state.grind_input, key),
             _ => {}
         },
     }
@@ -117,6 +120,23 @@ fn submit_contract_deploy(app: &mut App) {
             return;
         }
     };
+    let max_gas_price = match parse_u128(
+        app.deploy_state.max_gas_price_input.value().trim(),
+        "max gas price",
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            app.deploy_state.result_msg = err;
+            return;
+        }
+    };
+    let grind = match parse_u64(app.deploy_state.grind_input.value(), "grind iterations") {
+        Ok(v) => v.min(100_000),
+        Err(err) => {
+            app.deploy_state.result_msg = err;
+            return;
+        }
+    };
 
     push_log(&mut app.deploy_state.logs, "loading signing wallet");
     let mut node = app.node.lock().unwrap();
@@ -157,7 +177,7 @@ fn submit_contract_deploy(app: &mut App) {
         to: None,
         value,
         gas_limit,
-        max_gas_price: 1000,
+        max_gas_price,
         mining_tip: fee,
         expiration_height: None,
         payload,
@@ -166,7 +186,7 @@ fn submit_contract_deploy(app: &mut App) {
         public_key: vec![],
         signature: vec![],
     };
-    let tx = match sign_tx(tx, node.core.cfg.chain_id, &wallet) {
+    let tx = match sign_with_optional_grind(tx, node.core.cfg.chain_id, &wallet, grind) {
         Ok(t) => t,
         Err(e) => {
             app.deploy_state.result_msg = format!("sign error: {e}");
@@ -198,7 +218,7 @@ fn submit_contract_deploy(app: &mut App) {
             "waiting for miner to include tx in a block",
         );
         app.deploy_state.deploy_path_input.reset();
-        app.deploy_state.focus = 4;
+        app.deploy_state.focus = 6;
     } else {
         let error = result.error.unwrap_or_else(|| "unknown error".to_string());
         app.deploy_state.result_msg = format!("failed: {}", error);
@@ -247,6 +267,8 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -304,14 +326,43 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     render_input(
         f,
         chunks[3],
+        " Max Gas Price ",
+        app.deploy_state.max_gas_price_input.value(),
+        field_style(
+            style(3),
+            parse_u128(
+                app.deploy_state.max_gas_price_input.value().trim(),
+                "max gas price",
+            )
+            .is_ok(),
+        ),
+    );
+    render_input(
+        f,
+        chunks[4],
         " Mining Tip ",
         app.deploy_state.fee_input.value(),
         field_style(
-            style(3),
+            style(4),
             parse_u128(app.deploy_state.fee_input.value().trim(), "fee").is_ok(),
         ),
     );
-    let btn_style = if app.deploy_state.focus == 4 {
+    render_input(
+        f,
+        chunks[5],
+        " Grind Nonces (0-100000) ",
+        app.deploy_state.grind_input.value(),
+        field_style(
+            style(5),
+            app.deploy_state
+                .grind_input
+                .value()
+                .trim()
+                .parse::<u64>()
+                .is_ok(),
+        ),
+    );
+    let btn_style = if app.deploy_state.focus == 6 {
         Style::default()
             .bg(Color::Magenta)
             .fg(Color::Black)
@@ -323,13 +374,13 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Paragraph::new(" [ DEPLOY CONTRACT ] ")
             .block(Block::default().borders(Borders::ALL))
             .style(btn_style),
-        chunks[4],
+        chunks[6],
     );
     f.render_widget(
         Paragraph::new(app.deploy_state.result_msg.clone())
             .block(Block::default().borders(Borders::ALL).title(" Result "))
             .style(Style::default().fg(Color::Green)),
-        chunks[5],
+        chunks[7],
     );
     f.render_widget(
         Paragraph::new(app.deploy_state.logs.join("\n"))
@@ -339,7 +390,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
                     .title(" Live Deploy Log "),
             )
             .style(Style::default().fg(Color::Cyan)),
-        chunks[6],
+        chunks[8],
     );
 }
 
